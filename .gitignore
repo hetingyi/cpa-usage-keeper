@@ -5,6 +5,8 @@
 .worktrees/
 plans/
 AGENTS.md
+.gocache/
+.gomodcache/
 
 # local environment files
 .env
