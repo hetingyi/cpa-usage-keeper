@@ -18,7 +18,7 @@ import {
 } from '../PriceSettingsCard';
 
 const countOccurrences = (text: string, value: string) => text.split(value).length - 1;
-const source = readFileSync(new URL('../PriceSettingsCard.tsx', import.meta.url), 'utf8');
+const source = readFileSync(new URL('../PriceSettingsCard.tsx', import.meta.url), 'utf8').replace(/\r\n/g, '\n');
 
 const syncDraft = (model: string): PricingSyncDraft => ({
   model,
