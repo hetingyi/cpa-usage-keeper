@@ -1,47 +1,32 @@
 import { describe, expect, it } from 'vitest';
 import { SPARKLINE_COLORS, buildUsageSparklineSeries } from './useSparklines';
-import type { UsagePayload } from './useUsageData';
+import type { UsageOverviewPayload } from './useUsageData';
 
-const usageWithBackendSeries: UsagePayload = {
-  total_requests: 9,
-  success_count: 8,
-  failure_count: 1,
-  total_tokens: 900,
-  requests_by_day: {},
-  requests_by_hour: {},
-  tokens_by_day: {},
-  tokens_by_hour: {},
+const usageWithBackendSeries: UsageOverviewPayload = {
+  usage: {
+    total_requests: 9,
+    success_count: 8,
+    failure_count: 1,
+    total_tokens: 900,
+  },
+  summary: {
+    rpm: 0.075,
+    tpm: 7.5,
+    total_cost: 1,
+    cost_available: true,
+    input_tokens: 500,
+    cache_read_tokens: 25,
+    cache_creation_tokens: 5,
+    reasoning_tokens: 0,
+  },
   series: {
-    requests: {
-      '2026-04-23T10:00:00Z': 2,
-      '2026-04-23T11:00:00Z': 4,
-    },
-    tokens: {
-      '2026-04-23T10:00:00Z': 200,
-      '2026-04-23T11:00:00Z': 800,
-    },
-    rpm: {
-      '2026-04-23T10:00:00Z': 2 / 60,
-      '2026-04-23T11:00:00Z': 4 / 60,
-    },
-    tpm: {
-      '2026-04-23T10:00:00Z': 200 / 60,
-      '2026-04-23T11:00:00Z': 800 / 60,
-    },
-    cost: {
-      '2026-04-23T10:00:00Z': 0.2,
-      '2026-04-23T11:00:00Z': 0.8,
-    },
-    input_tokens: {
-      '2026-04-23T10:00:00Z': 100,
-      '2026-04-23T11:00:00Z': 400,
-    },
-    output_tokens: {},
-    cached_tokens: {
-      '2026-04-23T10:00:00Z': 25,
-      '2026-04-23T11:00:00Z': 0,
-    },
-    reasoning_tokens: {},
+    buckets: ['2026-04-23T10:00:00Z', '2026-04-23T11:00:00Z'],
+    requests: [2, 4],
+    tokens: [200, 800],
+    rpm: [2 / 60, 4 / 60],
+    tpm: [200 / 60, 800 / 60],
+    cost: [0.2, 0.8],
+    cache_read_rate: [25, null],
   },
 };
 
@@ -57,29 +42,23 @@ describe('buildUsageSparklineSeries', () => {
     expect(series.rpm).toEqual([2 / 60, 4 / 60]);
     expect(series.tpm).toEqual([200 / 60, 800 / 60]);
     expect(series.cost).toEqual([0.2, 0.8]);
-    expect(series.cachedRate).toEqual([25, 0]);
+    expect(series.cacheReadRate).toEqual([25, null]);
   });
 
-  it('keeps cache rate at zero when a bucket has no input tokens', () => {
+  it('keeps cache rate empty when the backend omits a bucket cache rate', () => {
     const series = buildUsageSparklineSeries({
       usage: {
         ...usageWithBackendSeries,
         series: {
           ...usageWithBackendSeries.series!,
-          requests: {
-            '2026-04-23T10:00:00Z': 1,
-          },
-          input_tokens: {
-            '2026-04-23T10:00:00Z': 0,
-          },
-          cached_tokens: {
-            '2026-04-23T10:00:00Z': 25,
-          },
+          buckets: ['2026-04-23T10:00:00Z'],
+          requests: [1],
+          cache_read_rate: [],
         },
       },
     });
 
-    expect(series.cachedRate).toEqual([0]);
+    expect(series.cacheReadRate).toEqual([null]);
   });
 
   it('normalizes invalid sparkline series values to zero', () => {
@@ -89,27 +68,13 @@ describe('buildUsageSparklineSeries', () => {
         ...usageWithBackendSeries,
         series: {
           ...usageWithBackendSeries.series!,
-          requests: {
-            '2026-04-23T10:00:00Z': invalidNumber,
-          },
-          tokens: {
-            '2026-04-23T10:00:00Z': -4,
-          },
-          rpm: {
-            '2026-04-23T10:00:00Z': Number.POSITIVE_INFINITY,
-          },
-          tpm: {
-            '2026-04-23T10:00:00Z': Number.NaN,
-          },
-          cost: {
-            '2026-04-23T10:00:00Z': invalidNumber,
-          },
-          input_tokens: {
-            '2026-04-23T10:00:00Z': invalidNumber,
-          },
-          cached_tokens: {
-            '2026-04-23T10:00:00Z': 25,
-          },
+          buckets: ['2026-04-23T10:00:00Z'],
+          requests: [invalidNumber],
+          tokens: [-4],
+          rpm: [Number.POSITIVE_INFINITY],
+          tpm: [Number.NaN],
+          cost: [invalidNumber],
+          cache_read_rate: [invalidNumber],
         },
       },
     });
@@ -119,7 +84,7 @@ describe('buildUsageSparklineSeries', () => {
     expect(series.rpm).toEqual([0]);
     expect(series.tpm).toEqual([0]);
     expect(series.cost).toEqual([0]);
-    expect(series.cachedRate).toEqual([0]);
+    expect(series.cacheReadRate).toEqual([0]);
   });
 });
 

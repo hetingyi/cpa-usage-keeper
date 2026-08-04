@@ -21,7 +21,6 @@ func TestOpenDatabaseAddsUsagePerformanceIndexes(t *testing.T) {
 		"idx_usage_events_api_group_key",
 		"idx_usage_events_auth_index",
 		"idx_usage_events_model",
-		"idx_usage_events_source",
 		"idx_usage_events_auth_index_timestamp_id",
 		"idx_usage_events_auth_type_auth_index_id",
 		"idx_redis_usage_inboxes_status_id",
@@ -44,7 +43,13 @@ func TestOpenDatabaseAddsUsagePerformanceIndexes(t *testing.T) {
 		"idx_usage_events_trim_provider",
 		"idx_usage_events_trim_auth_type",
 		"idx_usage_events_trim_api_group_key",
+		"idx_usage_events_source",
+		"idx_usage_events_provider",
+		"idx_usage_events_auth_type",
 		"idx_usage_events_auth_type_source_id",
+		"idx_usage_events_api_group_key_timestamp_id",
+		"idx_usage_events_event_key",
+		"idx_usage_events_failed",
 		"idx_redis_usage_inboxes_status",
 		"idx_redis_usage_inboxes_queue_key",
 		"idx_redis_usage_inboxes_message_hash",
@@ -109,7 +114,6 @@ func TestUsagePerformanceIndexesSupportRepresentativeQueryPlans(t *testing.T) {
 
 	assertQueryPlanUsesIndex(t, db, "idx_usage_events_model", `
 		EXPLAIN QUERY PLAN SELECT DISTINCT model FROM usage_events
-		WHERE model <> ''
 		ORDER BY model ASC`)
 
 	assertQueryPlanUsesIndex(t, db, "idx_usage_events_auth_index", `

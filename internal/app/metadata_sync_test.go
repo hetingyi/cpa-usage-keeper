@@ -126,6 +126,14 @@ func TestMetadataSyncRunnerValidatesConfig(t *testing.T) {
 	}
 }
 
+func TestMetadataSyncRunnerDefaultsRefreshDebounceToOneSecond(t *testing.T) {
+	runner := NewMetadataSyncRunner(&metadataSyncStub{}, time.Minute)
+
+	if runner.refreshDebounce != time.Second {
+		t.Fatalf("expected default refresh debounce to be 1s, got %s", runner.refreshDebounce)
+	}
+}
+
 func TestMetadataSyncRunnerRefreshSupportMakesPeriodicTickNoop(t *testing.T) {
 	syncer := &metadataSyncStub{}
 	runner := NewMetadataSyncRunner(syncer, time.Millisecond)

@@ -19,6 +19,7 @@ type usageIdentitiesStub struct {
 	pagedActiveItems []entities.UsageIdentity
 	pagedActiveTotal int64
 	pagedTypeCounts  []service.UsageIdentityTypeCount
+	pagedHealth      []service.UsageCredentialHealthSnapshot
 	pagedActiveReq   *service.ListUsageIdentitiesRequest
 	err              error
 }
@@ -39,9 +40,16 @@ func (s usageIdentitiesStub) ListActiveUsageIdentitiesPage(_ context.Context, re
 		*s.pagedActiveReq = request
 	}
 	if s.pagedActiveItems != nil || s.pagedActiveTotal != 0 {
-		return service.ListUsageIdentitiesResponse{Items: s.pagedActiveItems, Total: s.pagedActiveTotal, TypeCounts: s.pagedTypeCounts}, s.err
+		return service.ListUsageIdentitiesResponse{Items: s.pagedActiveItems, Total: s.pagedActiveTotal, TypeCounts: s.pagedTypeCounts, CredentialHealth: s.pagedHealth}, s.err
 	}
 	return service.ListUsageIdentitiesResponse{Items: s.items, Total: int64(len(s.items)), TypeCounts: s.pagedTypeCounts}, s.err
+}
+
+func (s usageIdentitiesStub) UpdateUsageIdentityAlias(context.Context, int64, string) (entities.UsageIdentity, error) {
+	if len(s.items) == 0 {
+		return entities.UsageIdentity{}, s.err
+	}
+	return s.items[0], s.err
 }
 
 func TestUsageIdentitiesRouteReturnsMetadataStatsAndActiveRows(t *testing.T) {
@@ -71,6 +79,7 @@ func TestUsageIdentitiesRouteReturnsMetadataStatsAndActiveRows(t *testing.T) {
 		OutputTokens:               200,
 		ReasoningTokens:            30,
 		CachedTokens:               40,
+		CacheReadTokens:            45,
 		TotalTokens:                370,
 		LastAggregatedUsageEventID: 99,
 		FirstUsedAt:                &firstUsedAt,
@@ -127,7 +136,7 @@ func TestUsageIdentitiesRouteReturnsMetadataStatsAndActiveRows(t *testing.T) {
 		`"input_tokens":100`,
 		`"output_tokens":200`,
 		`"reasoning_tokens":30`,
-		`"cached_tokens":40`,
+		`"cache_read_tokens":45`,
 		`"total_tokens":370`,
 		`"last_aggregated_usage_event_id":"99"`,
 		`"first_used_at":"2026-05-04T08:00:00Z"`,
@@ -138,6 +147,9 @@ func TestUsageIdentitiesRouteReturnsMetadataStatsAndActiveRows(t *testing.T) {
 		if !contains(body, expected) {
 			t.Fatalf("expected %s in response body: %s", expected, body)
 		}
+	}
+	if contains(body, `"cached_tokens"`) {
+		t.Fatalf("did not expect legacy cached_tokens in response body: %s", body)
 	}
 }
 
@@ -304,6 +316,64 @@ func TestUsageIdentitiesPageRouteAcceptsRepeatedTypesAndReturnsTypeCounts(t *tes
 	}
 }
 
+func TestUsageIdentitiesPageRouteReturnsCredentialHealthSnapshot(t *testing.T) {
+	windowStart := time.Date(2026, 6, 15, 8, 0, 0, 0, time.UTC)
+	windowEnd := time.Date(2026, 6, 15, 13, 0, 0, 0, time.UTC)
+	bucketStart := time.Date(2026, 6, 15, 12, 40, 0, 0, time.UTC)
+	router := NewRouter(nil, nil, nil, nil, AuthConfig{}, nil, "", OptionalProviders{UsageIdentity: usageIdentitiesStub{
+		pagedActiveTotal: 1,
+		pagedActiveItems: []entities.UsageIdentity{{
+			ID:           12,
+			Name:         "Claude Team",
+			AuthType:     entities.UsageIdentityAuthTypeAIProvider,
+			AuthTypeName: "apikey",
+			Identity:     "claude-auth",
+			Type:         "claude",
+			Provider:     "Claude Team",
+		}},
+		pagedHealth: []service.UsageCredentialHealthSnapshot{{
+			WindowSeconds: 5 * 60 * 60,
+			BucketSeconds: 10 * 60,
+			WindowStart:   windowStart,
+			WindowEnd:     windowEnd,
+			TotalSuccess:  2,
+			TotalFailure:  1,
+			SuccessRate:   66.6666666667,
+			Buckets: []service.UsageCredentialHealthBucket{{
+				StartTime: bucketStart,
+				EndTime:   bucketStart.Add(10 * time.Minute),
+				Success:   2,
+				Failure:   1,
+				Rate:      0.6666666667,
+			}},
+		}},
+	}})
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/usage/identities/page?auth_type=2&page=1&page_size=10", nil)
+	resp := httptest.NewRecorder()
+
+	router.ServeHTTP(resp, req)
+
+	body := resp.Body.String()
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", resp.Code, body)
+	}
+	for _, expected := range []string{
+		`"credential_health":{`,
+		`"window_seconds":18000`,
+		`"bucket_seconds":600`,
+		`"window_start":"2026-06-15T08:00:00Z"`,
+		`"window_end":"2026-06-15T13:00:00Z"`,
+		`"total_success":2`,
+		`"total_failure":1`,
+		`"success_rate":66.6666666667`,
+		`"buckets":[{"start_time":"2026-06-15T12:40:00Z","end_time":"2026-06-15T12:50:00Z","success":2,"failure":1,"rate":0.6666666667}]`,
+	} {
+		if !contains(body, expected) {
+			t.Fatalf("expected %s in response body: %s", expected, body)
+		}
+	}
+}
+
 func TestUsageIdentitiesRouteReturnsProviderDisplayName(t *testing.T) {
 	router := NewRouter(nil, nil, nil, nil, AuthConfig{}, nil, "", OptionalProviders{UsageIdentity: usageIdentitiesStub{items: []entities.UsageIdentity{{
 		ID:           1,
@@ -324,8 +394,8 @@ func TestUsageIdentitiesRouteReturnsProviderDisplayName(t *testing.T) {
 	if resp.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d: %s", resp.Code, body)
 	}
-	if !contains(body, `"displayName":"Provider Name(Team Prefix)"`) {
-		t.Fatalf("expected displayName with name and prefix, got %s", body)
+	if !contains(body, `"displayName":"Team Prefix"`) {
+		t.Fatalf("expected displayName with prefix, got %s", body)
 	}
 	if !contains(body, `"prefix":"Team Prefix"`) {
 		t.Fatalf("expected published prefix field, got %s", body)
@@ -353,7 +423,7 @@ func TestUsageIdentitiesRouteMasksAIProviderIdentity(t *testing.T) {
 	if !contains(body, `"identity":"`+maskedLookupKey+`"`) {
 		t.Fatalf("expected masked AI provider identity %q in response body: %s", maskedLookupKey, body)
 	}
-	if !contains(body, `"name":"Provider Name"`) || !contains(body, `"provider":"OpenAI"`) || !contains(body, `"displayName":"Provider Name(Team Prefix)"`) {
+	if !contains(body, `"name":"Provider Name"`) || !contains(body, `"provider":"OpenAI"`) || !contains(body, `"displayName":"Team Prefix"`) {
 		t.Fatalf("expected AI provider display fields to use usage_identities values directly, got %s", body)
 	}
 }

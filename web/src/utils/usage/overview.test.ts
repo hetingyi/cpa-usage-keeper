@@ -1,6 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { getOverviewChartEndMs, getOverviewDisplayLoading, getOverviewHourWindowHours, getPreferredOverviewChartPeriod } from './overview';
-import type { UsageFilterWindow } from '.';
+import { getCurrentOverviewUsage, getDailyAverageCardUsage, getOverviewDisplayLoading, isDailyAverageRange } from './overview';
 
 describe('shared usage overview helpers', () => {
   it('keeps loading visible only while the overview has no usage payload', () => {
@@ -8,35 +7,36 @@ describe('shared usage overview helpers', () => {
     expect(getOverviewDisplayLoading({ loading: true, hasUsage: true })).toBe(false);
   });
 
-  it('resolves compact hourly chart windows for overview ranges', () => {
-    expect(getOverviewHourWindowHours({ timeRange: '4h', filterWindow: {} })).toBe(4);
-    expect(getOverviewHourWindowHours({ timeRange: '30d', filterWindow: {} })).toBe(24);
-    expect(getOverviewHourWindowHours({ timeRange: 'custom', filterWindow: { windowMinutes: 90 } })).toBe(2);
+  it('keeps stale overview responses away from range-scoped panels', () => {
+    const usage = { summary: { daily_average_requests: 12 } };
+
+    expect(getCurrentOverviewUsage(usage, '24h::', '7d::')).toBeNull();
+    expect(getCurrentOverviewUsage(usage, '7d::', '7d::')).toBe(usage);
   });
 
-  it('switches overview charts to daily buckets for windows over 24 hours', () => {
-    expect(getPreferredOverviewChartPeriod({ windowMinutes: 24 * 60 })).toBe('hour');
-    expect(getPreferredOverviewChartPeriod({ windowMinutes: 24 * 60 + 1 })).toBe('day');
+  it('returns null before any overview response has been loaded for the current query', () => {
+    expect(getCurrentOverviewUsage({ summary: {} }, '7d::', null)).toBeNull();
+    expect(getCurrentOverviewUsage(null, '7d::', '7d::')).toBeNull();
   });
 
-  it('uses calendar day boundaries for today and yesterday ranges', () => {
-    const filterWindow: UsageFilterWindow = {
-      startMs: Date.parse('2026-04-23T00:00:00.000Z'),
-      endMs: Date.parse('2026-04-23T23:59:59.999Z'),
-      windowMinutes: 24 * 60,
-    };
+  it('identifies ranges that can show daily averages', () => {
+    expect(isDailyAverageRange({ range: '7d' })).toBe(true);
+    expect(isDailyAverageRange({ range: '30d' })).toBe(true);
+    expect(isDailyAverageRange({ range: 'custom', customStart: '2026-06-01', customEnd: '2026-06-02' })).toBe(true);
+    expect(isDailyAverageRange({ range: 'custom', customStart: '2026-06-01', customEnd: '2026-06-01' })).toBe(false);
+    expect(isDailyAverageRange({ range: 'custom', customStart: '2026-02-31', customEnd: '2026-03-02' })).toBe(false);
+    expect(isDailyAverageRange({ range: '24h' })).toBe(false);
+    expect(isDailyAverageRange({ range: 'today' })).toBe(false);
+    expect(isDailyAverageRange({ range: 'yesterday' })).toBe(false);
+  });
 
-    expect(getOverviewChartEndMs({
-      timeRange: 'today',
-      filterWindow,
-      fallbackEndMs: filterWindow.endMs ?? 0,
-      resolvedRangeEndMs: Date.parse('2026-04-23T15:59:59.999Z'),
-    })).toBe(Date.parse('2026-04-24T00:00:00.000Z'));
-    expect(getOverviewChartEndMs({
-      timeRange: 'yesterday',
-      filterWindow,
-      fallbackEndMs: Date.parse('2026-04-24T12:34:56.000Z'),
-      resolvedRangeEndMs: Date.parse('2026-04-23T23:59:59.999Z'),
-    })).toBe(Date.parse('2026-04-24T00:00:00.000Z'));
+  it('keeps the previous usage for the daily average card while another daily-average range loads', () => {
+    const currentUsage = { summary: { daily_average_requests: 30 } };
+    const fallbackUsage = { summary: { daily_average_requests: 7 } };
+
+    expect(getDailyAverageCardUsage(currentUsage, fallbackUsage, true)).toBe(currentUsage);
+    expect(getDailyAverageCardUsage(null, fallbackUsage, true, true)).toBe(fallbackUsage);
+    expect(getDailyAverageCardUsage(null, fallbackUsage, true, false)).toBeNull();
+    expect(getDailyAverageCardUsage(null, fallbackUsage, false, true)).toBeNull();
   });
 });

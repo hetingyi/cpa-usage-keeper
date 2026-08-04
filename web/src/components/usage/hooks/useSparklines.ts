@@ -1,12 +1,11 @@
 import { useCallback, useMemo } from 'react';
-import { calculateCacheRate } from '@/utils/usage';
 import type { UsageOverviewPayload } from './useUsageData';
 
 export interface SparklineData {
   labels: string[];
   datasets: [
     {
-      data: number[];
+      data: Array<number | null>;
       borderColor: string;
       backgroundColor: string;
       fill: boolean;
@@ -31,7 +30,7 @@ export interface UseSparklinesReturn {
   tokensSparkline: SparklineBundle | null;
   rpmSparkline: SparklineBundle | null;
   tpmSparkline: SparklineBundle | null;
-  cachedRateSparkline: SparklineBundle | null;
+  cacheReadRateSparkline: SparklineBundle | null;
   costSparkline: SparklineBundle | null;
 }
 
@@ -41,7 +40,7 @@ export interface UsageSparklineSeries {
   tokens: number[];
   rpm: number[];
   tpm: number[];
-  cachedRate: number[];
+  cacheReadRate: Array<number | null>;
   cost: number[];
 }
 
@@ -50,7 +49,7 @@ export const SPARKLINE_COLORS = {
   tokens: { border: '#8b5cf6', background: 'rgba(139, 92, 246, 0.18)' },
   rpm: { border: '#22c55e', background: 'rgba(34, 197, 94, 0.18)' },
   tpm: { border: '#f97316', background: 'rgba(249, 115, 22, 0.18)' },
-  cachedRate: { border: '#14b8a6', background: 'rgba(20, 184, 166, 0.18)' },
+  cacheReadRate: { border: '#14b8a6', background: 'rgba(20, 184, 166, 0.18)' },
   cost: { border: '#f59e0b', background: 'rgba(245, 158, 11, 0.18)' },
 } as const;
 
@@ -59,28 +58,31 @@ const normalizeSparklineNumber = (value: unknown): number => {
   return Number.isFinite(parsed) ? Math.max(parsed, 0) : 0;
 };
 
+const normalizeNullableSparklineNumber = (value: unknown): number | null => {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  return normalizeSparklineNumber(value);
+};
+
 export function buildUsageSparklineSeries({ usage }: Omit<UseSparklinesOptions, 'loading'>): UsageSparklineSeries {
   if (!usage?.series) {
-    return { labels: [], requests: [], tokens: [], rpm: [], tpm: [], cachedRate: [], cost: [] };
+    return { labels: [], requests: [], tokens: [], rpm: [], tpm: [], cacheReadRate: [], cost: [] };
   }
 
-  const labels = Object.keys(usage.series.requests ?? {}).sort((a, b) => a.localeCompare(b));
+  const labels = usage.series.buckets ?? [];
   if (!labels.length) {
-    return { labels: [], requests: [], tokens: [], rpm: [], tpm: [], cachedRate: [], cost: [] };
+    return { labels: [], requests: [], tokens: [], rpm: [], tpm: [], cacheReadRate: [], cost: [] };
   }
 
   return {
     labels,
-    requests: labels.map((label) => normalizeSparklineNumber(usage.series?.requests?.[label])),
-    tokens: labels.map((label) => normalizeSparklineNumber(usage.series?.tokens?.[label])),
-    rpm: labels.map((label) => normalizeSparklineNumber(usage.series?.rpm?.[label])),
-    tpm: labels.map((label) => normalizeSparklineNumber(usage.series?.tpm?.[label])),
-    cachedRate: labels.map((label) => {
-      const inputTokens = normalizeSparklineNumber(usage.series?.input_tokens?.[label]);
-      const cachedTokens = normalizeSparklineNumber(usage.series?.cached_tokens?.[label]);
-      return calculateCacheRate({ inputTokens, cachedTokens }) ?? 0;
-    }),
-    cost: labels.map((label) => normalizeSparklineNumber(usage.series?.cost?.[label])),
+    requests: labels.map((_, index) => normalizeSparklineNumber(usage.series?.requests?.[index])),
+    tokens: labels.map((_, index) => normalizeSparklineNumber(usage.series?.tokens?.[index])),
+    rpm: labels.map((_, index) => normalizeSparklineNumber(usage.series?.rpm?.[index])),
+    tpm: labels.map((_, index) => normalizeSparklineNumber(usage.series?.tpm?.[index])),
+    cacheReadRate: labels.map((_, index) => normalizeNullableSparklineNumber(usage.series?.cache_read_rate?.[index])),
+    cost: labels.map((_, index) => normalizeSparklineNumber(usage.series?.cost?.[index])),
   };
 }
 
@@ -92,7 +94,7 @@ export function useSparklines({ usage, loading }: UseSparklinesOptions): UseSpar
 
   const buildSparkline = useCallback(
     (
-      input: { labels: string[]; data: number[] },
+      input: { labels: string[]; data: Array<number | null> },
       color: string,
       backgroundColor: string
     ): SparklineBundle | null => {
@@ -139,9 +141,9 @@ export function useSparklines({ usage, loading }: UseSparklinesOptions): UseSpar
     [buildSparkline, series.labels, series.tpm]
   );
 
-  const cachedRateSparkline = useMemo(
-    () => buildSparkline({ labels: series.labels, data: series.cachedRate }, SPARKLINE_COLORS.cachedRate.border, SPARKLINE_COLORS.cachedRate.background),
-    [buildSparkline, series.cachedRate, series.labels]
+  const cacheReadRateSparkline = useMemo(
+    () => buildSparkline({ labels: series.labels, data: series.cacheReadRate }, SPARKLINE_COLORS.cacheReadRate.border, SPARKLINE_COLORS.cacheReadRate.background),
+    [buildSparkline, series.cacheReadRate, series.labels]
   );
 
   const costSparkline = useMemo(
@@ -154,7 +156,7 @@ export function useSparklines({ usage, loading }: UseSparklinesOptions): UseSpar
     tokensSparkline,
     rpmSparkline,
     tpmSparkline,
-    cachedRateSparkline,
+    cacheReadRateSparkline,
     costSparkline
   };
 }

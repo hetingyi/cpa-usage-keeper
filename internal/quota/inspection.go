@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"cpa-usage-keeper/internal/entities"
+	"cpa-usage-keeper/internal/helper"
 	"cpa-usage-keeper/internal/timeutil"
 )
 
@@ -35,6 +36,7 @@ type InspectionStatus struct {
 	LimitReached       int        `json:"limit_reached"`
 	Unauthorized401    int        `json:"unauthorized_401"`
 	PaymentRequired402 int        `json:"payment_required_402"`
+	Unauthorized401402 int        `json:"unauthorized_401_402"`
 	OtherFailed        int        `json:"other_failed"`
 	// Unknown 是 active Auth Files 中“没有可展示结果、也没有参与当前巡检刷新”的剩余数量。
 	Unknown int                `json:"unknown"`
@@ -151,8 +153,11 @@ func (s *Service) GetInspectionStatus(ctx context.Context) (InspectionStatus, er
 			status.LimitReached++
 		case InspectionResultStatusUnauthorized401:
 			status.Unauthorized401++
+			// 摘要口径把 401/402 合并，行级结果仍保留原始状态。
+			status.Unauthorized401402++
 		case InspectionResultStatusPaymentRequired402:
 			status.PaymentRequired402++
+			status.Unauthorized401402++
 		case InspectionResultStatusOtherFailed:
 			status.OtherFailed++
 		}
@@ -263,7 +268,7 @@ func inspectionResultForTask(identity entities.UsageIdentity, task *RefreshTaskR
 	// 展示字段优先使用入队时的身份快照，避免刷新过程中用户改名导致最近结果跳动。
 	result := InspectionResult{
 		AuthIndex:      identity.Identity,
-		Name:           firstNonEmpty(task.Name, identity.Name),
+		Name:           firstNonEmpty(strings.TrimSpace(task.Name), helper.UsageIdentityDisplayName(identity)),
 		Type:           firstNonEmpty(task.Type, identity.Type),
 		FileName:       task.FileName,
 		Error:          task.Error,
@@ -401,9 +406,15 @@ func kimiInspectionLimitReached(rows []QuotaRow) bool {
 }
 
 func xaiInspectionLimitReached(rows []QuotaRow) bool {
-	// xAI 支持显式 limit_reached，也支持 used/limit 费用类窗口。
+	// 新 xAI 行的显式 false 代表仍有其它额度（例如 PAYG）；旧缓存没有标志时才回退 used/limit。
 	for _, row := range rows {
-		if quotaRowLimitReached(row) || quotaRowUsedAtLimit(row) {
+		if row.LimitReached != nil {
+			if *row.LimitReached {
+				return true
+			}
+			continue
+		}
+		if quotaRowUsedAtLimit(row) {
 			return true
 		}
 	}
