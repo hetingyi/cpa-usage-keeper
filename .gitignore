@@ -1,5 +1,6 @@
 # internal docs
 .dev-docs/
+.agents/
 .claude/
 .codex/
 .worktrees/
@@ -12,7 +13,6 @@ AGENTS.md
 .env
 .env.*
 !.env.example
-!deploy/.env.example
 
 # runtime data
 /data/

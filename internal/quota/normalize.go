@@ -3,7 +3,6 @@ package quota
 import (
 	"fmt"
 	"math"
-	"net/url"
 	"sort"
 	"strings"
 	"time"
@@ -16,6 +15,8 @@ const (
 	quotaWindowSevenDaySeconds     int64 = 7 * 24 * 60 * 60
 	quotaWindowThirtyDaySeconds    int64 = 30 * 24 * 60 * 60
 	quotaWindowAverageMonthSeconds int64 = 365 * 24 * 60 * 60 / 12
+	antigravityGeminiGroupKey            = "antigravity-gemini-models"
+	antigravityClaudeGPTGroupKey         = "antigravity-claude-and-gpt-models"
 )
 
 func NormalizeQuotaRows(output ProviderOutput) []QuotaRow {
@@ -131,11 +132,6 @@ func normalizeCodexQuotaRows(result CodexResult) []QuotaRow {
 		primaryLabel := additional.LimitName + " 5h"
 		secondaryLabel := additional.LimitName + " Weekly"
 		rows = appendCodexWindowQuotaRows(rows, "additional_rate_limits."+additional.LimitName, primaryLabel, secondaryLabel, "additional", metric, additional.RateLimit)
-	}
-	if planType := strings.TrimSpace(result.Usage.PlanType); planType != "" {
-		for index := range rows {
-			rows[index].PlanType = planType
-		}
 	}
 	return rows
 }
@@ -320,6 +316,9 @@ func normalizeAntigravityQuotaRows(result AntigravityResult) []QuotaRow {
 }
 
 func antigravityQuotaGroupKey(displayName string, groupIndex int) string {
+	if knownKey, ok := knownAntigravityQuotaGroupKey(displayName); ok {
+		return knownKey
+	}
 	var normalized strings.Builder
 	pendingSeparator := false
 	for _, value := range strings.ToLower(strings.TrimSpace(displayName)) {
@@ -339,6 +338,33 @@ func antigravityQuotaGroupKey(displayName string, groupIndex int) string {
 		return fmt.Sprintf("antigravity-group-%d", groupIndex+1)
 	}
 	return "antigravity-" + normalized.String()
+}
+
+func knownAntigravityQuotaGroupKey(displayName string) (string, bool) {
+	words := strings.FieldsFunc(strings.ToLower(strings.TrimSpace(displayName)), func(value rune) bool {
+		return (value < 'a' || value > 'z') && (value < '0' || value > '9')
+	})
+	hasGemini := false
+	hasClaude := false
+	hasGPT := false
+	for _, word := range words {
+		switch word {
+		case "gemini":
+			hasGemini = true
+		case "claude":
+			hasClaude = true
+		case "gpt":
+			hasGPT = true
+		}
+	}
+	switch {
+	case hasGemini && !hasClaude && !hasGPT:
+		return antigravityGeminiGroupKey, true
+	case hasClaude && hasGPT && !hasGemini:
+		return antigravityClaudeGPTGroupKey, true
+	default:
+		return "", false
+	}
 }
 
 func normalizeAntigravityQuotaWindow(bucket AntigravityQuotaBucket) (string, string, *QuotaWindow) {
@@ -409,11 +435,20 @@ func normalizeKimiQuotaRows(result KimiResult) []QuotaRow {
 	if isMeaningfulKimiDetail(result.Usage.Usage) {
 		rows = append(rows, kimiDetailQuotaRow("usage", "summary", "Weekly", result.Usage.Usage))
 	}
+	if aggregate := result.Usage.Usages; aggregate != nil && aggregate.MonthTotal != nil {
+		monthly := aggregate.MonthTotal
+		used := monthly.UsedRatio * 100
+		rows = append(rows, QuotaRow{
+			Key: "usages.limit_month_total", Label: "Monthly", Scope: "summary",
+			Used: floatPtr(used), Limit: floatPtr(100), Remaining: floatPtr(100 - used),
+			UsedPercent: floatPtr(used), ResetAt: monthly.ResetTime,
+		})
+	}
 	return rows
 }
 
 func normalizeXAIQuotaRows(result XAIResult) []QuotaRow {
-	// xAI 两个 billing endpoint 同级返回，输出顺序固定为 Weekly、Monthly、PAYG、产品额度。
+	// xAI 两个 billing endpoint 同级返回，输出顺序固定为 Weekly、Monthly、PAYG；产品用量只附在 Weekly 内。
 	weeklyConfig := xaiBillingConfig(result.Weekly)
 	monthlyConfig := xaiBillingConfig(result.Monthly)
 	rows := make([]QuotaRow, 0, 3)
@@ -421,7 +456,6 @@ func normalizeXAIQuotaRows(result XAIResult) []QuotaRow {
 		rows = append(rows, row)
 	}
 	rows = append(rows, xaiMonthlyQuotaRows(monthlyConfig)...)
-	rows = append(rows, xaiProductQuotaRows(weeklyConfig)...)
 	return rows
 }
 
@@ -433,22 +467,25 @@ func xaiBillingConfig(payload *XAIBillingPayload) *XAIBillingConfig {
 }
 
 func xaiWeeklyQuotaRow(config *XAIBillingConfig) (QuotaRow, bool) {
-	if config == nil || config.CreditUsagePercent == nil {
+	if config == nil {
 		return QuotaRow{}, false
 	}
-	usedPercent := *config.CreditUsagePercent
-	limitReached := usedPercent >= 100
-	return QuotaRow{
-		Key:          xaiWeeklyBillingQuotaKey,
-		Label:        "Weekly",
-		Scope:        "billing",
-		Metric:       "weekly",
-		UsedPercent:  floatPtr(usedPercent),
-		Allowed:      boolPtr(!limitReached),
-		LimitReached: boolPtr(limitReached),
-		Window:       &QuotaWindow{Seconds: intPtr(quotaWindowSevenDaySeconds)},
-		ResetAt:      xaiWeeklyResetAt(config),
-	}, true
+	breakdown := xaiProductUsageBreakdown(config)
+	if config.CreditUsagePercent == nil && len(breakdown) == 0 {
+		return QuotaRow{}, false
+	}
+	row := QuotaRow{
+		Key: xaiWeeklyBillingQuotaKey, Label: "Weekly", Scope: "billing", Metric: "weekly",
+		UsedPercent: config.CreditUsagePercent, UsageBreakdown: breakdown,
+		Window: &QuotaWindow{Seconds: intPtr(quotaWindowSevenDaySeconds)}, ResetAt: xaiWeeklyResetAt(config),
+	}
+	// 总用量缺失时仍保留明细，但不求和或据此推断耗尽状态。
+	if config.CreditUsagePercent != nil {
+		reached := *config.CreditUsagePercent >= 100
+		row.Allowed = boolPtr(!reached)
+		row.LimitReached = boolPtr(reached)
+	}
+	return row, true
 }
 
 func xaiMonthlyQuotaRows(config *XAIBillingConfig) []QuotaRow {
@@ -520,54 +557,35 @@ func xaiMonthlyQuotaRows(config *XAIBillingConfig) []QuotaRow {
 	return rows
 }
 
-func xaiProductQuotaRows(config *XAIBillingConfig) []QuotaRow {
-	if config == nil || len(config.ProductUsage) == 0 {
+func xaiProductUsageBreakdown(config *XAIBillingConfig) []QuotaUsageBreakdown {
+	if config == nil {
 		return nil
 	}
-	type productQuota struct {
-		name           string
-		normalizedName string
-		usedPercent    float64
-	}
-	products := make(map[string]productQuota, len(config.ProductUsage))
+	products := make(map[string]QuotaUsageBreakdown, len(config.ProductUsage))
 	for _, item := range config.ProductUsage {
 		name := strings.Join(strings.Fields(item.Product), " ")
-		normalizedName := strings.ToLower(name)
-		if normalizedName == "" || item.UsagePercent == nil {
+		key := strings.ToLower(name)
+		if key == "" {
 			continue
 		}
-		if current, ok := products[normalizedName]; ok {
-			if *item.UsagePercent > current.usedPercent {
-				current.usedPercent = *item.UsagePercent
-				products[normalizedName] = current
-			}
-			continue
+		current, exists := products[key]
+		if !exists {
+			products[key] = QuotaUsageBreakdown{Product: name, UsedPercent: item.UsagePercent}
+		} else if item.UsagePercent != nil && (current.UsedPercent == nil || *item.UsagePercent > *current.UsedPercent) {
+			current.UsedPercent = item.UsagePercent
+			products[key] = current
 		}
-		products[normalizedName] = productQuota{name: name, normalizedName: normalizedName, usedPercent: *item.UsagePercent}
 	}
-	ordered := make([]productQuota, 0, len(products))
-	for _, product := range products {
-		ordered = append(ordered, product)
+	keys := make([]string, 0, len(products))
+	for key := range products {
+		keys = append(keys, key)
 	}
-	sort.Slice(ordered, func(i, j int) bool {
-		return ordered[i].normalizedName < ordered[j].normalizedName
-	})
-	rows := make([]QuotaRow, 0, len(ordered))
-	for _, product := range ordered {
-		limitReached := product.usedPercent >= 100
-		rows = append(rows, QuotaRow{
-			Key:          "billing.weekly.product." + url.QueryEscape(product.normalizedName),
-			Label:        product.name + " Usage",
-			Scope:        "product",
-			Metric:       product.name,
-			UsedPercent:  floatPtr(product.usedPercent),
-			Allowed:      boolPtr(!limitReached),
-			LimitReached: boolPtr(limitReached),
-			Window:       &QuotaWindow{Seconds: intPtr(quotaWindowSevenDaySeconds)},
-			ResetAt:      xaiWeeklyResetAt(config),
-		})
+	sort.Strings(keys)
+	result := make([]QuotaUsageBreakdown, 0, len(keys))
+	for _, key := range keys {
+		result = append(result, products[key])
 	}
-	return rows
+	return result
 }
 
 func xaiWeeklyResetAt(config *XAIBillingConfig) string {

@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-FROM node:22-alpine AS web-builder
+FROM node:24-alpine AS web-builder
 WORKDIR /app/web
 COPY web/package.json web/package-lock.json ./
 RUN npm ci
@@ -21,7 +21,7 @@ RUN CGO_ENABLED=1 GOOS=linux go build \
     -ldflags="-s -w -X cpa-usage-keeper/internal/version.Version=${VERSION}" \
     -o /out/cpa-usage-keeper ./cmd/server/main.go
 
-FROM alpine:3.20
+FROM alpine:3.24
 WORKDIR /
 RUN apk add --no-cache ca-certificates tzdata su-exec \
 	&& addgroup -S app \

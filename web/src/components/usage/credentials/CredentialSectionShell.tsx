@@ -1,6 +1,8 @@
 import type { CSSProperties, ReactNode } from 'react'
 import styles from './CredentialSections.module.scss'
+import { Select } from '@/components/ui/Select'
 import { formatCompactNumber } from '@/utils/usage'
+import { CREDENTIAL_PAGE_SIZE_OPTIONS } from './credentialViewModels'
 
 type CredentialSectionStyle = CSSProperties
 
@@ -15,10 +17,12 @@ interface CredentialSectionShellProps {
 }
 
 interface CredentialRowShellProps {
+  icon?: ReactNode
   title: ReactNode
   subtitle?: ReactNode
   badges: ReactNode
   metrics: ReactNode
+  metricsTitle?: string
   side: ReactNode
   rowClassName?: string
 }
@@ -52,18 +56,23 @@ export function CredentialSectionShell({ title, subtitle, countLabel, titleExtra
   )
 }
 
-export function CredentialRowShell({ title, subtitle, badges, metrics, side, rowClassName }: CredentialRowShellProps) {
+export function CredentialRowShell({ icon, title, subtitle, badges, metrics, metricsTitle, side, rowClassName }: CredentialRowShellProps) {
   // 统一三段式行结构：左侧身份信息、中间指标、右侧 quota/状态区域。
   return (
     <article className={`${styles.credentialRow} ${rowClassName ?? ''}`.trim()}>
       <div className={styles.credentialIdentityBlock}>
-        <div className={styles.credentialNameRow}>
-          <span className={styles.credentialDisplayName}>{title}</span>
-          {badges && <div className={styles.credentialBadges}>{badges}</div>}
+        {icon}
+        <div className={styles.credentialIdentityContent}>
+          <div className={styles.credentialNameRow}>
+            <div className={styles.credentialNameMain}>
+              <span className={styles.credentialDisplayName}>{title}</span>
+            </div>
+            {badges && <div className={styles.credentialBadges}>{badges}</div>}
+          </div>
+          {subtitle && <span className={styles.credentialIdentityText}>{subtitle}</span>}
         </div>
-        {subtitle && <span className={styles.credentialIdentityText}>{subtitle}</span>}
       </div>
-      <div className={styles.credentialMetricGroup}>{metrics}</div>
+      <div className={styles.credentialMetricGroup} title={metricsTitle}>{metrics}</div>
       <div className={styles.credentialSidePanel}>{side}</div>
     </article>
   )
@@ -139,7 +148,10 @@ export function cacheReadRateTone(value: number | null): 'success' | 'warning' |
   return 'neutral'
 }
 
-const CREDENTIAL_PAGE_SIZE_OPTIONS = [5, 10, 20, 50]
+const CREDENTIAL_PAGE_SIZE_SELECT_OPTIONS = CREDENTIAL_PAGE_SIZE_OPTIONS.map((option) => ({
+  value: String(option),
+  label: String(option),
+}))
 
 export function CredentialsPagination({
   leadingControls,
@@ -176,24 +188,47 @@ export function CredentialsPagination({
     return null
   }
 
+  const selectedSortLabel = sortOptions?.find((option) => option.value === sortValue)?.label
+
   return (
     <div className={styles.credentialPagination}>
       <div className={styles.credentialPaginationControls}>
         {leadingControls}
         {sortOptions && sortOptions.length > 0 && sortLabel && onSortChange && (
-          <label className={styles.credentialPageSizeControl}>
+          <div className={styles.credentialPageSizeControl}>
             <span>{sortLabel}</span>
-            <select value={sortValue} onChange={(event) => onSortChange(event.target.value)}>
-              {sortOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
-            </select>
-          </label>
+            <div className={styles.credentialPaginationSortControl}>
+              <span
+                className={styles.credentialPaginationSortSizer}
+                data-credential-pagination-sort-sizer="true"
+                aria-hidden="true"
+              >
+                {sortOptions.map((option) => <span key={option.value}>{option.label}</span>)}
+              </span>
+              <Select
+                value={sortValue ?? ''}
+                options={sortOptions}
+                onChange={onSortChange}
+                className={`${styles.credentialPaginationSelect} ${styles.credentialPaginationSortSelect}`}
+                ariaLabel={selectedSortLabel ? `${sortLabel}: ${selectedSortLabel}` : sortLabel}
+                fullWidth
+                dropdownMinWidth={180}
+              />
+            </div>
+          </div>
         )}
-        <label className={styles.credentialPageSizeControl}>
+        <div className={styles.credentialPageSizeControl}>
           <span>{rowsPerPageLabel}</span>
-          <select value={pageSize} onChange={(event) => onPageSizeChange(Number(event.target.value))}>
-            {CREDENTIAL_PAGE_SIZE_OPTIONS.map((option) => <option key={option} value={option}>{option}</option>)}
-          </select>
-        </label>
+          <Select
+            value={String(pageSize)}
+            options={CREDENTIAL_PAGE_SIZE_SELECT_OPTIONS}
+            onChange={(value) => onPageSizeChange(Number(value))}
+            className={`${styles.credentialPaginationSelect} ${styles.credentialPaginationPageSizeSelect}`}
+            ariaLabel={`${rowsPerPageLabel}: ${pageSize}`}
+            fullWidth={false}
+            dropdownMinWidth={72}
+          />
+        </div>
         <button type="button" onClick={() => onPageChange(page - 1)} disabled={page <= 1}>{previousLabel}</button>
         <span className={styles.credentialPaginationPage}>{page} / {totalPages}</span>
         <button type="button" onClick={() => onPageChange(page + 1)} disabled={page >= totalPages}>{nextLabel}</button>

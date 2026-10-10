@@ -59,6 +59,8 @@ type App struct {
 	Poller       StatusProvider
 	RedisIngest  Runner
 	RedisProcess Runner
+	// CPAErrors 是完全独立的 best-effort errors 订阅；停止或失败不影响 Usage 与 HTTP。
+	CPAErrors Runner
 	// UsageAggregation 是唯一串行调度三类派生聚合事务的后台 runner。
 	UsageAggregation  Runner
 	Ranking           Runner
@@ -198,15 +200,17 @@ func NewWithConfig(cfg config.Config) (*App, error) {
 
 	cpaClient := cpa.NewClient(cfg.CPABaseURL, cfg.CPAManagementKey, cfg.RequestTimeout, cfg.TLSSkipVerify)
 	quotaService := quota.NewServiceWithOptions(db, cpaClient, quota.ServiceOptions{
-		RefreshWorkerLimit: cfg.QuotaRefreshWorkerLimit,
-		PricingCatalog:     pricingCatalog,
+		RefreshWorkerLimit:            cfg.QuotaRefreshWorkerLimit,
+		QuotaUpstreamResponsesEnabled: cfg.QuotaUpstreamResponsesEnabled,
+		PricingCatalog:                pricingCatalog,
 	})
 	// 单 writer aggregation runner 只维护 rollups/Identity，并在 App.Run 时主动追平。
 	usageAggregationRunner := poller.NewUsageAggregationRunner(db)
 	// syncService 仍然是 metadata 和 usage 处理共享的业务服务入口。
 	syncService := service.NewSyncServiceWithOptions(db, service.SyncServiceOptions{
-		BaseURL: cfg.CPABaseURL,
-		Client:  cpaClient,
+		UsageRawRetentionDays: cfg.UsageRawRetentionDays,
+		BaseURL:               cfg.CPABaseURL,
+		Client:                cpaClient,
 		// usage_events 事务提交后通过这个缓存做非阻塞增量追加，供 Overview realtime 和右边界补偿复用。
 		RecentUsageEvents: recentUsageCache,
 		// usage 与 metadata 提交后只唤醒单 writer runner，不在前台链路执行派生聚合。
@@ -251,6 +255,18 @@ func NewWithConfig(cfg config.Config) (*App, error) {
 	redisIngestRunner.SetControlMessageObserver(metadataSyncRunner)
 	// redisProcessRunner 仍然只处理本地 inbox 到 usage_events 的消费。
 	redisProcessRunner := poller.NewRedisProcessRunner(syncService)
+	// errorEventService 同时承担 Errors runner 的直接写入和详情 API 的分页读取。
+	errorEventService := service.NewErrorEventService(db)
+	// Errors 使用独立 RESP source，固定订阅 errors channel，不修改或复用 Usage subscriber 生命周期。
+	redisErrorSubscribeSource := poller.NewRedisErrorSubscribeSource(poller.RedisSubscribeOptions{
+		BaseURL:       cfg.CPABaseURL,
+		RedisAddr:     cfg.RedisQueueAddr,
+		ManagementKey: cfg.CPAManagementKey,
+		Timeout:       cfg.RequestTimeout,
+		TLS:           cfg.RedisQueueTLS,
+		TLSSkipVerify: cfg.TLSSkipVerify,
+	})
+	redisErrorIngestRunner := poller.NewRedisErrorIngestRunner(redisErrorSubscribeSource, errorEventService)
 	// backgroundPoller 继续组合远端 ingest 和本地 process 的状态展示。
 	backgroundPoller := poller.NewRedisPoller(redisIngestRunner, redisProcessRunner)
 	var backupMaintenance *DatabaseBackupRunner
@@ -290,7 +306,11 @@ func NewWithConfig(cfg config.Config) (*App, error) {
 		OnDisplayNameChanged: quotaService.UpdateUsageIdentityDisplayNameSnapshot,
 	})
 	cpaAPIKeyService := service.NewCPAAPIKeyService(db)
-	authFilesManagementService := service.NewAuthFilesManagementService(cpaClient)
+	// 单条凭证开关成功后立即与 CPA 对齐；runner 自带合并窗口和 nil 保护。
+	credentialMutationLocks := &service.CredentialMutationLocks{}
+	authFilesManagementService := service.NewAuthFilesManagementService(cpaClient, credentialMutationLocks)
+	credentialStatusService := service.NewCredentialStatusService(db, cpaClient, metadataSyncRunner, credentialMutationLocks)
+	credentialPriorityService := service.NewCredentialPriorityService(db, cpaClient, metadataSyncRunner, credentialMutationLocks)
 	if cfg.TLSSkipVerify {
 		logrus.WithField("cpa_base_url", cfg.CPABaseURL).Warn("TLS certificate verification is disabled for CPA and Redis queue connections")
 	}
@@ -301,12 +321,13 @@ func NewWithConfig(cfg config.Config) (*App, error) {
 		sessionManager = auth.NewPersistentSessionManager(cfg.AuthSessionTTL, auth.NewGormSessionStore(db))
 	}
 	authConfig := api.AuthConfig{
-		Enabled:              cfg.AuthEnabled,
-		LoginPassword:        cfg.LoginPassword,
-		SessionTTL:           cfg.AuthSessionTTL,
-		BasePath:             cfg.AppBasePath,
-		FrameAncestorOrigins: frameAncestorOrigins(cfg),
-		TrustedProxyCIDRs:    cfg.TrustedProxyCIDRs,
+		Enabled:                         cfg.AuthEnabled,
+		LoginPassword:                   cfg.LoginPassword,
+		SessionTTL:                      cfg.AuthSessionTTL,
+		BasePath:                        cfg.AppBasePath,
+		FrameAncestorOrigins:            frameAncestorOrigins(cfg),
+		TrustedProxyCIDRs:               cfg.TrustedProxyCIDRs,
+		APIKeyViewerLocalRankingEnabled: cfg.APIKeyViewerLocalRankingEnabled,
 	}
 	authHandler := api.NewAuthHandler(authConfig, sessionManager)
 
@@ -320,6 +341,7 @@ func NewWithConfig(cfg config.Config) (*App, error) {
 		// Redis ingest/process 分成两个后台 runner，避免远端订阅拉取和本地 SQLite 处理互相等待。
 		RedisIngest:       redisIngestRunner,
 		RedisProcess:      redisProcessRunner,
+		CPAErrors:         redisErrorIngestRunner,
 		UsageAggregation:  usageAggregationRunner,
 		Ranking:           rankingRunner,
 		LocalRanking:      localRankingRunner,
@@ -341,12 +363,16 @@ func NewWithConfig(cfg config.Config) (*App, error) {
 			cfg.AppBasePath,
 			api.OptionalProviders{
 				UsageIdentity: usageIdentityService,
+				ErrorEvents:   errorEventService,
 				Quota:         quotaService,
 				CPAAPIKeys:    cpaAPIKeyService,
 				AuthFiles:     authFilesManagementService,
-				RequestLogs:   requestLogService,
-				Ranking:       rankingService,
-				LocalRanking:  localRankingService,
+				// 认证文件与 AI 供应商共用一个 service，路由层按类型分发。
+				CredentialStatus:   credentialStatusService,
+				CredentialPriority: credentialPriorityService,
+				RequestLogs:        requestLogService,
+				Ranking:            rankingService,
+				LocalRanking:       localRankingService,
 				Status: api.StatusRouteConfig{
 					CPAPublicURL:               cfg.CPAPublicURL,
 					CPARequestLogAccessEnabled: cfg.CPARequestLogAccessEnabled,
@@ -447,6 +473,14 @@ func (a *App) Run() error {
 		a.startBackgroundTask(func() {
 			if err := a.RedisProcess.Run(ctx); err != nil {
 				logrus.Errorf("redis process stopped: %v", err)
+			}
+		})
+	}
+	if a.CPAErrors != nil {
+		a.startBackgroundTask(func() {
+			// Errors 是可选在线观测；runner 内部吞掉订阅/写入失败，这里只防御意外实现错误。
+			if err := a.CPAErrors.Run(ctx); err != nil {
+				logrus.Errorf("CPA errors ingest stopped: %v", err)
 			}
 		})
 	}

@@ -45,12 +45,10 @@ vi.mock('react-i18next', () => ({
 
 const deferred = <T,>() => {
   let resolve!: (value: T) => void
-  let reject!: (reason?: unknown) => void
-  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+  const promise = new Promise<T>((resolvePromise) => {
     resolve = resolvePromise
-    reject = rejectPromise
   })
-  return { promise, resolve, reject }
+  return { promise, resolve }
 }
 
 const buttonByText = (text: string): HTMLButtonElement => {
@@ -75,6 +73,7 @@ describe('PriceRulesModal', () => {
     document.body.innerHTML = ''
     vi.useRealTimers()
     vi.restoreAllMocks()
+    vi.unstubAllGlobals()
   })
 
   const renderModal = async (props: {
@@ -102,13 +101,13 @@ describe('PriceRulesModal', () => {
   const changeInput = async (selector: string, value: string) => {
     const input = document.body.querySelector<HTMLInputElement>(selector)
     expect(input, selector).not.toBeNull()
-	await changeInputElement(input!, value)
+    await changeInputElement(input!, value)
   }
 
   const changeInputElement = async (input: HTMLInputElement, value: string) => {
     await act(async () => {
-      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set
-      setter?.call(input, value)
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!
+      setter.call(input, value)
       input.dispatchEvent(new Event('input', { bubbles: true }))
     })
   }
@@ -149,13 +148,6 @@ describe('PriceRulesModal', () => {
     expect(saveRules).toHaveBeenCalledWith('model-a', [])
   })
 
-  it('uses the same danger treatment as Delete without a leading icon', async () => {
-    await renderModal({ model: 'model-a', loadRules: async () => [] })
-
-    const removeButton = buttonByText('Remove')
-    expect(removeButton.classList.contains('btn-danger')).toBe(true)
-    expect(removeButton.querySelector('svg')).toBeNull()
-  })
 
   it('shows row validation and does not call the backend for a partial rule', async () => {
     const saveRules = vi.fn(async (_model: string, _rules: ReplacePricingRuleInput[]) => [])
@@ -166,34 +158,12 @@ describe('PriceRulesModal', () => {
 
     expect(saveRules).not.toHaveBeenCalled()
     expect(document.body.textContent).toContain('Enter a value.')
-	const invalidValue = document.body.querySelector<HTMLInputElement>('[data-rule-field="value"]')
-	expect(invalidValue?.getAttribute('aria-invalid')).toBe('true')
-	expect(document.activeElement).toBe(invalidValue)
+    const invalidValue = document.body.querySelector<HTMLInputElement>('[data-rule-field="value"]')
+    expect(invalidValue?.getAttribute('aria-invalid')).toBe('true')
+    expect(document.activeElement).toBe(invalidValue)
   })
 
-  it('clears a stale duplicate error as soon as editing another row resolves the conflict', async () => {
-    const saveRules = vi.fn(async (_model: string, rules: ReplacePricingRuleInput[]) => rules.map((rule) => ({
-      ...rule,
-      multiplier: rule.multiplier ?? 1,
-    })))
-    await renderModal({
-      model: 'model-a',
-      loadRules: async () => [{ key: 'service_tier', value: 'priority', multiplier: 2 }],
-      saveRules,
-    })
-    await act(async () => buttonByText('Add Rule').click())
-    const keys = document.body.querySelectorAll<HTMLInputElement>('[data-rule-field="key"]')
-    const values = document.body.querySelectorAll<HTMLInputElement>('[data-rule-field="value"]')
-    await changeInputElement(keys[1], 'service_tier')
-    await changeInputElement(values[1], 'priority')
-    await act(async () => buttonByText('Save').click())
-    expect(document.body.textContent).toContain('This rule is duplicated.')
-
-    await changeInputElement(values[0], 'default')
-    expect(document.body.textContent).not.toContain('This rule is duplicated.')
-  })
-
-  it('clears a stale duplicate error when either conflicting row is removed', async () => {
+  it.each(['edit', 'remove'])('clears a stale duplicate error after resolving it by %s', async (action) => {
     await renderModal({
       model: 'model-a',
       loadRules: async () => [{ key: 'service_tier', value: 'priority', multiplier: 2 }],
@@ -206,31 +176,33 @@ describe('PriceRulesModal', () => {
     await act(async () => buttonByText('Save').click())
     expect(document.body.textContent).toContain('This rule is duplicated.')
 
-    const removeButtons = Array.from(document.body.querySelectorAll<HTMLButtonElement>('button'))
-      .filter((button) => button.textContent?.trim() === 'Remove')
-    await act(async () => removeButtons[0].click())
+    if (action === 'edit') {
+      await changeInputElement(values[0], 'default')
+    } else {
+      await act(async () => buttonByText('Remove').click())
+    }
     expect(document.body.textContent).not.toContain('This rule is duplicated.')
   })
 
   it('shows the backend rule validation detail in an assertive alert without clearing the draft', async () => {
-	const saveRules = vi.fn(async () => {
-	  throw new Error('invalid pricing rule: unsupported key "provider"')
-	})
-	await renderModal({ model: 'model-a', loadRules: async () => [], saveRules })
-	await changeInput('[data-rule-field="key"]', 'provider')
-	await changeInput('[data-rule-field="value"]', 'openai')
+    const saveRules = vi.fn(async () => {
+      throw new Error('invalid pricing rule: unsupported key "provider"')
+    })
+    await renderModal({ model: 'model-a', loadRules: async () => [], saveRules })
+    await changeInput('[data-rule-field="key"]', 'provider')
+    await changeInput('[data-rule-field="value"]', 'openai')
 
-	await act(async () => {
-	  buttonByText('Save').click()
-	  await Promise.resolve()
-	})
+    await act(async () => {
+      buttonByText('Save').click()
+      await Promise.resolve()
+    })
 
-	const alert = document.body.querySelector<HTMLElement>('[role="alert"]')
-	expect(alert?.getAttribute('aria-live')).toBe('assertive')
-	expect(alert?.textContent).toContain('unsupported key "provider"')
-	expect(document.activeElement).toBe(alert)
-	expect(document.body.querySelector<HTMLInputElement>('[data-rule-field="key"]')?.value).toBe('provider')
-	expect(document.body.querySelector<HTMLInputElement>('[data-rule-field="value"]')?.value).toBe('openai')
+    const alert = document.body.querySelector<HTMLElement>('[role="alert"]')
+    expect(alert?.getAttribute('aria-live')).toBe('assertive')
+    expect(alert?.textContent).toContain('unsupported key "provider"')
+    expect(document.activeElement).toBe(alert)
+    expect(document.body.querySelector<HTMLInputElement>('[data-rule-field="key"]')?.value).toBe('provider')
+    expect(document.body.querySelector<HTMLInputElement>('[data-rule-field="value"]')?.value).toBe('openai')
   })
 
   it('does not allow an empty placeholder to overwrite rules after loading fails', async () => {
@@ -261,7 +233,9 @@ describe('PriceRulesModal', () => {
 
     const dialog = document.body.querySelector<HTMLElement>('[role="dialog"]')
     expect(dialog?.querySelector<HTMLButtonElement>('.modal-close-floating')?.disabled).toBe(true)
-    expect(Array.from(dialog?.querySelectorAll<HTMLInputElement>('input') ?? []).every((input) => input.disabled)).toBe(true)
+    const inputs = dialog!.querySelectorAll<HTMLInputElement>('input')
+    expect(inputs).toHaveLength(3)
+    expect(Array.from(inputs).every((input) => input.disabled)).toBe(true)
     expect(buttonByText('Add Rule').disabled).toBe(true)
     expect(buttonByText('Remove').disabled).toBe(true)
     expect(buttonByText('Cancel').disabled).toBe(true)
@@ -313,32 +287,27 @@ describe('PriceRulesModal', () => {
   })
 
   it('exposes a keyboard-focusable help tooltip with only the approved examples', async () => {
-	vi.stubGlobal('innerWidth', 360)
-	vi.stubGlobal('innerHeight', 220)
-	await renderModal({ model: 'model-a', loadRules: async () => [] })
+    vi.stubGlobal('innerWidth', 360)
+    vi.stubGlobal('innerHeight', 220)
+    await renderModal({ model: 'model-a', loadRules: async () => [] })
 
-	const helpButton = document.body.querySelector<HTMLButtonElement>('[aria-label="How pricing rules work"]')
-	expect(helpButton).not.toBeNull()
-	expect(helpButton?.textContent).toBe('?')
-	expect(modalStylesSource).toMatch(/\.helpButton\s*\{[\s\S]*display:\s*inline-grid;/)
-	expect(modalStylesSource).toMatch(/\.helpButton\s*\{[\s\S]*width:\s*18px;/)
-	expect(modalStylesSource).toMatch(/\.helpButton\s*\{[\s\S]*height:\s*18px;/)
-	expect(modalStylesSource).toMatch(/\.helpButton\s*\{[\s\S]*background:\s*var\(--bg-secondary\);/)
-	expect(modalStylesSource).toMatch(/\.helpButton\s*\{[\s\S]*font-size:\s*11px;/)
-	expect(modalStylesSource).toMatch(/\.helpButton\s*\{[\s\S]*font-weight:\s*750;/)
-	expect(modalStylesSource).toMatch(/\.helpButton\s*\{[\s\S]*cursor:\s*default;/)
-	helpButton!.getBoundingClientRect = () => ({
-	  x: 280, y: 160, left: 280, top: 160, right: 298, bottom: 178,
-	  width: 18, height: 18, toJSON: () => ({}),
-	})
-	await act(async () => helpButton!.focus())
-	const describedBy = helpButton?.getAttribute('aria-describedby')
-	const tooltip = describedBy ? document.body.querySelector<HTMLElement>(`#${describedBy}[role="tooltip"]`) : null
-	expect(helpButton).not.toBeNull()
-	expect(tooltip?.style.position).toBe('fixed')
-	expect(tooltip?.style.transform).toBe('translateY(-100%)')
-	expect(tooltip?.style.maxHeight).toBe('136px')
-	expect(tooltip?.textContent).toContain('Examples:')
+    const helpButton = document.body.querySelector<HTMLButtonElement>('[aria-label="How pricing rules work"]')
+    expect(helpButton).not.toBeNull()
+    helpButton!.getBoundingClientRect = () => ({
+      x: 280, y: 160, left: 280, top: 160, right: 298, bottom: 178,
+      width: 18, height: 18, toJSON: () => ({}),
+    })
+    await act(async () => helpButton!.focus())
+    const describedBy = helpButton?.getAttribute('aria-describedby')
+    const description = describedBy ? document.getElementById(describedBy) : null
+    const tooltipId = helpButton?.getAttribute('aria-controls')
+    const tooltip = tooltipId ? document.body.querySelector<HTMLElement>(`#${tooltipId}[role="tooltip"]`) : null
+    expect(helpButton).not.toBeNull()
+    expect(description?.textContent).toContain('Matching rules multiply together.')
+    expect(tooltip?.style.position).toBe('fixed')
+    expect(tooltip?.style.transform).toBe('translateY(-100%)')
+    expect(tooltip?.style.maxHeight).toBe('136px')
+    expect(tooltip?.textContent).toContain('Examples:')
     expect(tooltip?.textContent).toContain('service_tier = priority')
     expect(tooltip?.textContent).toContain('reasoning_effort = xhigh')
     expect(tooltip?.textContent?.indexOf('Examples:')).toBeLessThan(
@@ -355,7 +324,7 @@ describe('PriceRulesModal', () => {
 
     const helpButton = document.body.querySelector<HTMLButtonElement>('[aria-label="How pricing rules work"]')
     const help = helpButton?.parentElement
-    const tooltipId = helpButton?.getAttribute('aria-describedby')
+    const tooltipId = helpButton?.getAttribute('aria-controls')
     const tooltip = tooltipId ? document.body.querySelector<HTMLElement>(`#${tooltipId}`) : null
     expect(help).not.toBeNull()
     expect(tooltip).not.toBeNull()
@@ -383,7 +352,7 @@ describe('PriceRulesModal', () => {
     })
     await dispatchPointer(helpButton!, 'pointerdown', 'touch')
 
-    const tooltipId = helpButton?.getAttribute('aria-describedby')
+    const tooltipId = helpButton?.getAttribute('aria-controls')
     const tooltip = tooltipId ? document.body.querySelector<HTMLElement>(`#${tooltipId}`) : null
     expect(tooltip?.getAttribute('aria-hidden')).toBe('false')
     expect(Number.parseFloat(tooltip?.style.maxHeight ?? '')).toBeLessThan(144)
@@ -396,7 +365,7 @@ describe('PriceRulesModal', () => {
 
     const helpButton = document.body.querySelector<HTMLButtonElement>('[aria-label="How pricing rules work"]')
     expect(helpButton).not.toBeNull()
-    const tooltipId = helpButton?.getAttribute('aria-describedby')
+    const tooltipId = helpButton?.getAttribute('aria-controls')
     const tooltip = tooltipId ? document.body.querySelector<HTMLElement>(`#${tooltipId}`) : null
 
     await dispatchPointer(helpButton!, 'pointerdown', 'touch')

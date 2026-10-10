@@ -2,7 +2,6 @@ package test
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"path/filepath"
 	"testing"
@@ -32,7 +31,7 @@ func (h *recordingProviderHandler) Check(ctx context.Context, input quota.Provid
 }
 
 func TestServiceRejectsEmptyAuthIndex(t *testing.T) {
-	service := newQuotaServiceWithRegistry(t, openQuotaTestDB(t), quota.NewProviderRegistry(nil))
+	service := newQuotaServiceWithRegistry(t, nil, quota.NewProviderRegistry(nil))
 
 	_, err := service.Check(context.Background(), quota.CheckRequest{AuthIndex: "   "})
 	if !errors.Is(err, quota.ErrValidation) {
@@ -73,6 +72,48 @@ func TestServiceDispatchesAuthFileIdentityByProviderBeforeType(t *testing.T) {
 	}
 }
 
+func TestServiceResolvesSubscription(t *testing.T) {
+	for _, tc := range []struct {
+		name, provider, identityPlan, wantPlan string
+		result                                 any
+	}{
+		{"Codex realtime overrides identity", "codex", "plus", "pro-20x", quota.CodexResult{Usage: &quota.CodexUsagePayload{PlanType: "pro", RateLimit: &quota.CodexRateLimitInfo{}}}},
+		{"Codex identity fallback", "codex", "team", "team", quota.CodexResult{Usage: &quota.CodexUsagePayload{RateLimit: &quota.CodexRateLimitInfo{}}}},
+		{"Claude realtime", "claude", "", "max", quota.ClaudeResult{
+			Usage:   &quota.ClaudeUsagePayload{FiveHour: &quota.ClaudeUsageWindow{Utilization: 25}},
+			Profile: &quota.ClaudeProfileResponse{Account: &quota.ClaudeProfileAccount{HasClaudeMax: new(true)}},
+		}},
+		{"Antigravity realtime", "antigravity", "", "ultra-lite", quota.AntigravityResult{
+			Quota:        &quota.AntigravityQuotaPayload{Groups: []quota.AntigravityQuotaGroup{{DisplayName: "Gemini Models", Buckets: []quota.AntigravityQuotaBucket{{BucketID: "gemini-5h", RemainingFraction: new(0.5)}}}}},
+			Subscription: &quota.AntigravitySubscriptionPayload{PaidTier: &quota.GeminiCliUserTier{ID: "g1-ultra-lite-tier", Name: "Ultra Lite"}},
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := openQuotaTestDB(t)
+			identity := entities.UsageIdentity{AuthType: entities.UsageIdentityAuthTypeAuthFile, Identity: tc.provider + "-auth", Provider: tc.provider, Type: tc.provider, Name: "auth file"}
+			if tc.identityPlan != "" {
+				identity.PlanType = &tc.identityPlan
+			}
+			if tc.provider == "antigravity" {
+				identity.ProjectID = new("project-123")
+			}
+			seedUsageIdentity(t, db, identity)
+			handler := &recordingProviderHandler{output: quota.ProviderOutput{Provider: tc.provider, Result: tc.result}}
+			service := newQuotaServiceWithRegistry(t, db, quota.NewProviderRegistry(map[string]quota.ProviderHandler{tc.provider: handler}))
+			response, err := service.Check(context.Background(), quota.CheckRequest{AuthIndex: identity.Identity})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if response.Subscription == nil || response.Subscription.Provider != tc.provider || response.Subscription.Plan != tc.wantPlan {
+				t.Fatalf("unexpected subscription: %+v", response.Subscription)
+			}
+			if tc.provider == "antigravity" && (response.Subscription.TierID != "g1-ultra-lite-tier" || response.Subscription.TierName != "Ultra Lite") {
+				t.Fatalf("unexpected subscription tier: %+v", response.Subscription)
+			}
+		})
+	}
+}
+
 func TestServiceFallsBackToTypeWhenProviderMissing(t *testing.T) {
 	db := openQuotaTestDB(t)
 	seedUsageIdentity(t, db, entities.UsageIdentity{AuthType: entities.UsageIdentityAuthTypeAuthFile, Identity: "gemini-auth", Provider: "Gemini", Type: "gemini-cli", Name: "auth file"})
@@ -105,11 +146,7 @@ func TestServiceReturnsUnsupportedType(t *testing.T) {
 func TestServiceAllowsCodexQuotaWithoutAccountID(t *testing.T) {
 	db := openQuotaTestDB(t)
 	seedUsageIdentity(t, db, entities.UsageIdentity{AuthType: entities.UsageIdentityAuthTypeAuthFile, Identity: "codex-auth", Type: "codex", Name: "auth file"})
-	caller := &recordingManagementCaller{responses: []*apicall.Response{{
-		StatusCode: 200,
-		BodyText:   `{"plan_type":"plus","rate_limit":{"allowed":true,"limit_reached":false}}`,
-		Body:       json.RawMessage(`{"plan_type":"plus","rate_limit":{"allowed":true,"limit_reached":false}}`),
-	}}}
+	caller := &recordingManagementCaller{responses: []*apicall.Response{quotaAPIResponse(200, `{"plan_type":"plus","rate_limit":{"allowed":true,"limit_reached":false},"rate_limit_reset_credits":{"available_count":0}}`)}}
 	service := newQuotaServiceWithRegistry(t, db, quota.NewDefaultProviderRegistry(caller, quota.DefaultProviderConfigs()))
 
 	response, err := service.Check(context.Background(), quota.CheckRequest{AuthIndex: "codex-auth"})
@@ -118,6 +155,9 @@ func TestServiceAllowsCodexQuotaWithoutAccountID(t *testing.T) {
 	}
 	if response.ID != "codex-auth" || len(caller.requests) != 1 {
 		t.Fatalf("expected codex quota request without account_id, got response=%+v requests=%d", response, len(caller.requests))
+	}
+	if response.Subscription == nil || response.Subscription.Provider != "codex" || response.Subscription.Plan != "plus" {
+		t.Fatalf("expected codex subscription in check response, got %+v", response.Subscription)
 	}
 }
 

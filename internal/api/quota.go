@@ -1,8 +1,10 @@
 package api
 
 import (
+	"context"
 	"errors"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"cpa-usage-keeper/internal/quota"
@@ -18,6 +20,62 @@ const quotaResetErrorFailed = "quota_reset_failed"
 const quotaResetCreditsErrorFailed = "quota_reset_credits_failed"
 
 func registerQuotaRoutes(router gin.IRoutes, provider QuotaProvider) {
+	router.DELETE("/quota/history/:auth_index/cycles/:cycle_id", func(c *gin.Context) {
+		if provider == nil {
+			writeInternalError(c, "quota provider is not configured", nil)
+			return
+		}
+		authIndex := strings.TrimSpace(c.Param("auth_index"))
+		cycleID, err := strconv.ParseInt(c.Param("cycle_id"), 10, 64)
+		if authIndex == "" || err != nil || cycleID <= 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "auth_index and positive cycle_id are required"})
+			return
+		}
+		if err := provider.DeleteCodexQuotaHistoryCycle(c.Request.Context(), authIndex, cycleID); err != nil {
+			switch {
+			case errors.Is(err, quota.ErrValidation), errors.Is(err, quota.ErrUnsupportedType):
+				c.JSON(http.StatusBadRequest, gin.H{"error": "quota cycle delete request is invalid"})
+			case errors.Is(err, quota.ErrNotFound):
+				c.JSON(http.StatusNotFound, gin.H{"error": "quota cycle or auth identity not found"})
+			default:
+				writeInternalError(c, "quota cycle deletion failed", err)
+			}
+			return
+		}
+		c.Status(http.StatusNoContent)
+	})
+
+	router.GET("/quota/history/:auth_index", func(c *gin.Context) {
+		if provider == nil {
+			writeInternalError(c, "quota provider is not configured", nil)
+			return
+		}
+		// 路径只接受详情抽屉当前 Auth File 的稳定 auth_index，空白不能退化成宽查询。
+		authIndex := strings.TrimSpace(c.Param("auth_index"))
+		if authIndex == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "auth_index is required"})
+			return
+		}
+		request := quota.CodexQuotaHistoryRequest{AuthIndex: authIndex}
+		if rawRole, ok := c.GetQuery("window_role"); ok {
+			role := strings.TrimSpace(rawRole)
+			request.WindowRole = &role
+		}
+		response, err := provider.GetCodexQuotaHistory(c.Request.Context(), request)
+		if err != nil {
+			switch {
+			case errors.Is(err, quota.ErrValidation), errors.Is(err, quota.ErrUnsupportedType):
+				c.JSON(http.StatusBadRequest, gin.H{"error": "quota history request is invalid"})
+			case errors.Is(err, quota.ErrNotFound):
+				c.JSON(http.StatusNotFound, gin.H{"error": "quota auth identity not found"})
+			default:
+				writeInternalError(c, "quota history lookup failed", err)
+			}
+			return
+		}
+		c.JSON(http.StatusOK, response)
+	})
+
 	router.GET("/quota/auto-refresh/settings", func(c *gin.Context) {
 		if provider == nil {
 			writeInternalError(c, "quota provider is not configured", nil)
@@ -200,6 +258,22 @@ func registerQuotaRoutes(router gin.IRoutes, provider QuotaProvider) {
 		}
 		c.JSON(http.StatusOK, response)
 	})
+	// Claude 状态查询仅挂载在原管理员 quota 路由组，不扩展 Codex credits 合同。
+	router.GET("/quota/claude-reset-grants/:auth_index", func(c *gin.Context) {
+		reader, ok := provider.(interface {
+			GetClaudeResetGrants(context.Context, string) (quota.ClaudeResetGrantsResponse, error)
+		})
+		if !ok {
+			writeQuotaResetCreditsError(c, http.StatusBadRequest, quota.ErrUnsupportedType)
+			return
+		}
+		response, err := reader.GetClaudeResetGrants(c.Request.Context(), c.Param("auth_index"))
+		if err != nil {
+			writeQuotaResetCreditsError(c, quotaProviderErrorStatus(err), err)
+			return
+		}
+		c.JSON(http.StatusOK, response)
+	})
 	router.POST("/quota/reset", func(c *gin.Context) {
 		if provider == nil {
 			writeInternalError(c, "quota provider is not configured", nil)
@@ -207,7 +281,9 @@ func registerQuotaRoutes(router gin.IRoutes, provider QuotaProvider) {
 		}
 
 		var request struct {
-			AuthIndex string `json:"auth_index"`
+			AuthIndex      string `json:"auth_index"`
+			GrantID        string `json:"grant_id"`
+			OrganizationID string `json:"organization_id"`
 		}
 		if err := c.ShouldBindJSON(&request); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "auth_index is required"})
@@ -219,7 +295,7 @@ func registerQuotaRoutes(router gin.IRoutes, provider QuotaProvider) {
 			return
 		}
 
-		response, err := provider.Reset(c.Request.Context(), quota.ResetRequest{AuthIndex: authIndex})
+		response, err := provider.Reset(c.Request.Context(), quota.ResetRequest{AuthIndex: authIndex, GrantID: request.GrantID, OrganizationID: request.OrganizationID})
 		if err != nil {
 			switch {
 			case errors.Is(err, quota.ErrValidation):

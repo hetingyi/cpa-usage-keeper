@@ -32,6 +32,8 @@ type StatusProvider interface {
 }
 
 type QuotaProvider interface {
+	GetCodexQuotaHistory(context.Context, quota.CodexQuotaHistoryRequest) (quota.CodexQuotaHistoryResponse, error)
+	DeleteCodexQuotaHistoryCycle(context.Context, string, int64) error
 	GetCachedQuota(context.Context, quota.CacheRequest) (quota.CacheResponse, error)
 	Refresh(context.Context, quota.RefreshRequest) (quota.RefreshResponse, error)
 	GetRefreshTaskByAuthIndex(context.Context, string) (quota.RefreshTaskResponse, error)
@@ -49,14 +51,17 @@ type StatusRouteConfig struct {
 }
 
 type OptionalProviders struct {
-	UsageIdentity service.UsageIdentityProvider
-	Quota         QuotaProvider
-	CPAAPIKeys    service.CPAAPIKeyProvider
-	AuthFiles     service.AuthFilesManagementProvider
-	RequestLogs   service.RequestLogProvider
-	Ranking       rankinghttpapi.Provider
-	LocalRanking  rankinghttpapi.LocalProvider
-	Status        StatusRouteConfig
+	UsageIdentity      service.UsageIdentityProvider
+	ErrorEvents        service.ErrorEventProvider
+	Quota              QuotaProvider
+	CPAAPIKeys         service.CPAAPIKeyProvider
+	AuthFiles          service.AuthFilesManagementProvider
+	CredentialStatus   service.CredentialStatusProvider
+	CredentialPriority service.CredentialPriorityProvider
+	RequestLogs        service.RequestLogProvider
+	Ranking            rankinghttpapi.Provider
+	LocalRanking       rankinghttpapi.LocalProvider
+	Status             StatusRouteConfig
 }
 
 func NewRouter(
@@ -93,18 +98,24 @@ func NewRouter(
 	authHandler.registerRoutes(authGroup)
 
 	var usageIdentityProvider service.UsageIdentityProvider
+	var errorEventProvider service.ErrorEventProvider
 	var quotaProvider QuotaProvider
 	var cpaAPIKeyProvider service.CPAAPIKeyProvider
 	var authFilesProvider service.AuthFilesManagementProvider
+	var credentialStatusProvider service.CredentialStatusProvider
+	var credentialPriorityProvider service.CredentialPriorityProvider
 	var requestLogProvider service.RequestLogProvider
 	var rankingProvider rankinghttpapi.Provider
 	var localRankingProvider rankinghttpapi.LocalProvider
 	var statusConfig StatusRouteConfig
 	if len(optionalProviders) > 0 {
 		usageIdentityProvider = optionalProviders[0].UsageIdentity
+		errorEventProvider = optionalProviders[0].ErrorEvents
 		quotaProvider = optionalProviders[0].Quota
 		cpaAPIKeyProvider = optionalProviders[0].CPAAPIKeys
 		authFilesProvider = optionalProviders[0].AuthFiles
+		credentialStatusProvider = optionalProviders[0].CredentialStatus
+		credentialPriorityProvider = optionalProviders[0].CredentialPriority
 		requestLogProvider = optionalProviders[0].RequestLogs
 		rankingProvider = optionalProviders[0].Ranking
 		localRankingProvider = optionalProviders[0].LocalRanking
@@ -128,7 +139,10 @@ func NewRouter(
 	registerUsageAnalysisRoute(adminProtected, usageProvider, cpaAPIKeyProvider)
 	registerUsageEventsRoute(adminProtected, usageProvider, usageIdentityProvider, cpaAPIKeyProvider, requestLogProvider, requestLogDownloadTokens, statusConfig.CPARequestLogAccessEnabled)
 	registerUsageIdentityRoutes(adminProtected, usageIdentityProvider)
+	registerErrorEventRoutes(adminProtected, errorEventProvider)
 	registerAuthFileManagementRoutes(adminProtected, authFilesProvider)
+	registerCredentialStatusRoutes(adminProtected, credentialStatusProvider)
+	registerCredentialPriorityRoutes(adminProtected, credentialPriorityProvider)
 	registerAuthSessionManagementRoutes(adminProtected, authHandler)
 	registerCPAAPIKeyRoutes(adminProtected, cpaAPIKeyProvider)
 	registerPricingRoutes(adminProtected, pricingProvider)
@@ -142,8 +156,16 @@ func NewRouter(
 
 	keyViewerProtected := apiV1.Group("")
 	keyViewerProtected.Use(authHandler.apiKeyViewerMiddleware())
-	registerKeyOverviewRoute(keyViewerProtected, usageProvider, cpaAPIKeyProvider, authHandler)
-	registerKeyActivityRoute(keyViewerProtected, usageProvider, cpaAPIKeyProvider, authHandler)
+	keyViewerProtected.Use(authHandler.activeAPIKeyViewerMiddleware())
+	registerKeyOverviewRoute(keyViewerProtected, usageProvider)
+	registerKeyActivityRoute(keyViewerProtected, usageProvider)
+	registerKeyUsageAnalysisRoute(keyViewerProtected, usageProvider)
+	if rankingProvider != nil {
+		rankinghttpapi.RegisterKeyViewerRoutes(keyViewerProtected, rankingProvider)
+	}
+	if authConfig.APIKeyViewerLocalRankingEnabled && localRankingProvider != nil {
+		rankinghttpapi.RegisterKeyViewerLocalRoutes(keyViewerProtected, localRankingProvider)
+	}
 
 	if staticFS != nil {
 		if indexFile, err := staticFS.Open("index.html"); err == nil {

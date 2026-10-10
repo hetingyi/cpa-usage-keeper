@@ -3,6 +3,7 @@ export type AuthRole = 'admin' | 'api_key_viewer'
 export interface AuthSessionAPIKeySummary {
   display_key: string
   alias?: string
+  local_ranking_enabled?: boolean
 }
 
 export interface AuthSessionResponse {
@@ -19,9 +20,14 @@ export interface AuthManagedSessionItem {
   kind: AuthManagedSessionKind
   role: AuthRole
   source?: AuthManagedSessionSource
+  alias?: string
   current?: boolean
   loginAt?: string
+  lastSeenAt?: string
   expiresAt?: string
+  loginIp?: string
+  lastSeenIp?: string
+  userAgent?: string
   apiKeyId?: string
   label?: string
   displayKey?: string
@@ -145,37 +151,13 @@ export interface RealtimeTokenVelocityPoint {
   cost?: number
 }
 
-export interface RealtimeResponseLevelPoint {
-  bucket: string
-  ttft_p50_ms?: number
-  ttft_p95_ms?: number
-  latency_p50_ms?: number
-  latency_p95_ms?: number
-}
-
-export interface RealtimeResponseAveragePoint {
-  bucket: string
-  avg_ms?: number | null
-}
-
-export interface RealtimeResponseParticle {
-  bucket: string
-  timestamp?: string
-  ms: number
-  count: number
-}
-
-export interface RealtimeResponseDistributionSeries {
-  average_line: RealtimeResponseAveragePoint[]
-  particles: RealtimeResponseParticle[]
-  total_particles?: number
-  sampled?: boolean
-  max_particles?: number
-}
-
-export interface RealtimeResponseDistribution {
-  ttft: RealtimeResponseDistributionSeries
-  latency: RealtimeResponseDistributionSeries
+export interface RealtimeLatencyScatter {
+  points: Array<{ ttft_ms: number; latency_ms: number }>
+  total_points: number
+  p95_ttft_ms: number
+  p95_latency_ms: number
+  max_ttft_ms: number
+  max_latency_ms: number
 }
 
 export interface RealtimeUsageTopItem {
@@ -183,7 +165,7 @@ export interface RealtimeUsageTopItem {
   label: string
   tokens: number
   requests: number
-  cost?: number
+  cost?: number | null
   share: number
 }
 
@@ -208,21 +190,66 @@ export interface RealtimeCacheLevelPoint {
 	input_tokens: number
 }
 
+export interface RealtimeWindowSummary {
+  requests: number
+  failures: number
+  token_requests: number
+  cached_requests: number
+  total_tokens: number
+  input_tokens: number
+  output_tokens: number
+  reasoning_tokens: number
+  cache_read_tokens: number
+  cache_creation_tokens: number
+  cost: number | null
+}
+
+export interface RealtimeInsights {
+  summary: RealtimeWindowSummary
+  outcomes: Array<{ bucket: string; requests: number; failures: number }>
+}
+
 export interface OverviewRealtimeBlock {
+  insights?: RealtimeInsights
   window: OverviewRealtimeWindow
   timezone?: string
   bucket_seconds: number
   window_start?: string
   window_end?: string
   token_velocity: RealtimeTokenVelocityPoint[]
-  response_level: RealtimeResponseLevelPoint[]
-  response_distribution: RealtimeResponseDistribution
+  latency_scatter?: RealtimeLatencyScatter
   current_usage: RealtimeCurrentUsage
   request_level: RealtimeRequestLevelPoint[]
   cache_level: RealtimeCacheLevelPoint[]
 }
 
+export interface UsageComparisonItem {
+  token_series?: number[]
+  key: string
+  label: string
+  requests: number
+  failures: number
+  input_tokens: number
+  output_tokens: number
+  cache_read_tokens: number
+  cache_creation_tokens: number
+  reasoning_tokens: number
+  total_tokens: number
+  cost: number | null
+}
+
+export interface UsageOverviewComparisons {
+  buckets?: string[]
+  granularity?: 'hourly' | 'daily'
+  timezone?: string
+  models: UsageComparisonItem[]
+  api_keys?: UsageComparisonItem[]
+  auth_files?: UsageComparisonItem[]
+  ai_providers?: UsageComparisonItem[]
+}
+
 export interface UsageOverviewResponse {
+  comparisons?: UsageOverviewComparisons
   usage: UsageOverviewUsageSnapshot
   summary?: UsageOverviewSummary
   series?: UsageOverviewSeries
@@ -245,6 +272,7 @@ export interface UsageEvent {
   api_key?: string
   model: string
   model_alias?: string
+  response_model?: string
   reasoning_effort?: string
   service_tier?: string
   response_service_tier?: string
@@ -256,6 +284,8 @@ export interface UsageEvent {
   auth_index?: string
   isDelete?: boolean
   failed: boolean
+  status_code?: number | null
+  stream?: boolean | null
   latency_ms: number
   ttft_ms?: number
   speed_tps?: number
@@ -280,6 +310,42 @@ export interface UsageEventsResponse {
   page: number
   page_size: number
   total_pages: number
+  next_cursor?: string
+  has_more?: boolean
+}
+
+export interface ErrorEvent {
+  /** Keeper 本地事件主键，仅用于列表 key 与 cursor 稳定排序。 */
+  id: string
+  /** CPA 生成 Error Event 的时间，不是 Keeper 接收时间。 */
+  timestamp: string
+  /** CPA result.provider；缺失表示上游未提供。 */
+  provider?: string
+  /** CPA result.model；缺失表示上游未提供。 */
+  model?: string
+  /** CPA Error.HTTPStatus；上游无状态时当前契约为 500。 */
+  status_code: number
+  /** 原始 body 删除当前 Identity API Key、清理控制字符并限制长度后的展示摘要。 */
+  body_summary: string
+  /** 表示 body_summary 是否因 API 长度上限被截断。 */
+  body_truncated: boolean
+  /** CPA Error.Code；缺失表示上游没有结构化错误码。 */
+  code?: string
+  /** 错误发生时 CPA 是否认为该错误可重试。 */
+  retryable: boolean
+  /** 错误发生时 CPA 给出的凭证级下一次允许重试时间。 */
+  credential_retry_after?: string
+  /** 错误发生时 CPA 给出的模型级下一次允许重试时间。 */
+  model_retry_after?: string
+}
+
+export interface ErrorEventsResponse {
+  /** 当前 Identity 的 Error Event 游标页；body_summary 已删除真实 API Key。 */
+  events: ErrorEvent[]
+  /** 下一页 cursor；没有更多数据时缺失。 */
+  next_cursor?: string
+  /** 是否仍有下一页，前端不依赖总数查询。 */
+  has_more: boolean
 }
 
 export interface UsageEventRequestLogSection {
@@ -324,7 +390,27 @@ export interface UsageCredentialHealth {
   total_success: number
   total_failure: number
   success_rate: number
+  /** 窗口内 canonical input_tokens 合计，缓存率的分母。 */
+  input_tokens: number
+  /** 窗口内 canonical cache_read_tokens 合计，缓存率的分子。 */
+  cache_read_tokens: number
   buckets: UsageCredentialHealthBucket[]
+}
+
+export interface UsageSubscriptionInfo {
+  provider: string
+  plan: string
+  tierId?: string
+  tierName?: string
+}
+
+export interface UsageIdentityPeriodStats {
+  total_requests: number
+  success_count: number
+  failure_count: number
+  input_tokens: number
+  cache_read_tokens: number
+  total_tokens: number
 }
 
 export interface UsageIdentity {
@@ -343,7 +429,7 @@ export interface UsageIdentity {
   priority?: number
   disabled: boolean
   note?: string
-  plan_type?: string
+  subscription?: UsageSubscriptionInfo
   active_start?: string
   active_until?: string
   total_requests: number
@@ -358,6 +444,8 @@ export interface UsageIdentity {
   first_used_at?: string
   last_used_at?: string
   stats_updated_at?: string
+  stats_reset_at?: string
+  period_stats?: UsageIdentityPeriodStats
   credential_health?: UsageCredentialHealth
   is_deleted: boolean
   created_at: string
@@ -390,6 +478,7 @@ export interface UsageQuotaWindow {
 }
 
 export interface UsageQuotaRow {
+  usageBreakdown?: { product: string; usedPercent?: number }[]
   key: string
   label?: string
   scope?: string
@@ -397,7 +486,6 @@ export interface UsageQuotaRow {
   groupKey?: string
   groupLabel?: string
   groupDescription?: string
-  planType?: string
   used?: number
   limit?: number
   remaining?: number
@@ -415,13 +503,55 @@ export interface UsageQuotaRow {
 export interface UsageQuotaCheckResponse {
   id: string
   quota: UsageQuotaRow[]
+  subscription?: UsageSubscriptionInfo
   rateLimitResetCreditsAvailableCount?: number | null
+  claudeResetGrants?: ClaudeResetGrantStatus
+}
+
+export interface ClaudeResetGrant {
+  id: string
+  label?: string
+  resetsTotal: number
+  resetsLeft: number
+  startsAt?: string
+  endsAt?: string
+  clears: string[]
+  paused: boolean
+  usableNow: boolean
+  useRequiresLimit: boolean
+}
+
+export interface ClaudeResetGrantStatus {
+  eligible: boolean
+  ineligibleReason?: string
+  atLimit: boolean
+  grants: ClaudeResetGrant[]
+  nextGrantId?: string
+  weeklyResetsAt?: string
+  cooldownUntil?: string
+  availableCount: number
+}
+
+export interface ClaudeResetGrantsResponse {
+  authIndex: string
+  status: ClaudeResetGrantStatus | null
+  selectedGrantId?: string
+  organizationId?: string
+}
+
+export interface UsageQuotaUpstreamResponse {
+  method: string
+  url: string
+  status_code: number
+  header?: Record<string, string[]>
+  body: string
 }
 
 export interface UsageQuotaResetResponse {
   authIndex: string
   code?: string
   windowsReset?: number
+  recoveryFailed?: boolean
 }
 
 export interface UsageQuotaResetCredit {
@@ -446,10 +576,76 @@ export interface UsageQuotaCacheItem {
   http_status_code?: number
   expires_at?: string
   refreshed_at?: string
+  upstream_responses?: UsageQuotaUpstreamResponse[]
 }
 
 export interface UsageQuotaCacheResponse {
   items: UsageQuotaCacheItem[]
+}
+
+// CodexQuotaHistoryWindow 以最近响应存在的 Primary/Secondary 角色为稳定键，并携带最新周期标题。
+export interface CodexQuotaHistoryWindow {
+  window_role: 'primary' | 'secondary'
+  window_kind?: 'five_hour' | 'weekly' | 'monthly'
+  window_seconds: number
+  has_current_cycle: boolean
+  last_observed_at: string
+}
+
+// CodexQuotaHistoryUsage 是周期摘要与百分比变化区间共同复用的动态用量。
+export interface CodexQuotaHistoryUsage {
+  requests: number
+  successful_requests: number
+  failed_requests: number
+  input_tokens: number
+  output_tokens: number
+  reasoning_tokens: number
+  cache_read_tokens: number
+  cache_creation_tokens: number
+  total_tokens: number
+  total_cost_usd: number
+  cost_available: boolean
+}
+
+// CodexQuotaHistoryTransition 只表示真实观察到的相邻百分比变化；跨档不会补中间点。
+export interface CodexQuotaHistoryTransition {
+  from_remaining_percent: number
+  to_remaining_percent: number
+  percentage_points: number
+  is_direct: boolean
+  interval_started_at: string
+  interval_ended_at: string
+  usage: CodexQuotaHistoryUsage
+  tokens_per_point: number
+  cost_per_point: number
+  cost_per_point_available: boolean
+}
+
+// CodexQuotaHistoryCycle 同时提供周期真实边界、Keeper 观察边界、周期总量和效率区间。
+export interface CodexQuotaHistoryCycle {
+  id: number
+  status: 'current' | 'completed'
+  window_seconds: number
+  window_started_at: string
+  reset_at: string
+  effective_started_at: string
+  effective_ended_at: string
+  first_observed_at: string
+  last_observed_at: string
+  first_remaining_percent: number | null
+  last_remaining_percent: number | null
+  observation_count: number
+  usage: CodexQuotaHistoryUsage
+  transitions: CodexQuotaHistoryTransition[]
+}
+
+// CodexQuotaHistoryResponse 一次请求驱动当前周期图表和包含进行中周期的最近三十天完整列表。
+export interface CodexQuotaHistoryResponse {
+  generated_at: string
+  range_start: string
+  windows: CodexQuotaHistoryWindow[]
+  selected_window: CodexQuotaHistoryWindow | null
+  cycles: CodexQuotaHistoryCycle[]
 }
 
 export interface AuthFilesManagementResponse {
@@ -462,6 +658,7 @@ export interface UsageQuotaRefreshTaskResponse {
   file_name?: string
   status: 'queued' | 'running' | 'completed' | 'failed'
   quota?: UsageQuotaCheckResponse
+  upstream_responses?: UsageQuotaUpstreamResponse[]
   error?: string
   http_status_code?: number
   refreshed_at?: string
@@ -525,6 +722,17 @@ export interface AnalysisTokenUsageBucket {
   requests: number
   cost_usd: number
   cost_available: boolean
+}
+
+export interface AnalysisModelUsageSeries {
+  model: string
+  total_tokens: number[]
+  requests: number[]
+}
+
+export interface AnalysisModelUsagePayload {
+  buckets: string[]
+  series: AnalysisModelUsageSeries[]
 }
 
 export interface AnalysisCompositionItem {
@@ -622,6 +830,7 @@ export interface AnalysisResponse {
   range_start?: string
   range_end?: string
   token_usage: AnalysisTokenUsageBucket[]
+  model_usage?: AnalysisModelUsagePayload
   api_key_composition: AnalysisCompositionItem[]
   model_composition: AnalysisCompositionItem[]
   auth_files_composition: AnalysisCompositionItem[]
@@ -735,7 +944,10 @@ export interface PricingSyncMatch {
 	cache_write_price_per_1m: number
 }
 
+export type PricingSyncSource = 'models-dev' | 'litellm'
+
 export interface PricingSyncPreviewResponse {
+  source_id: PricingSyncSource
   source: string
   source_url: string
   metadata_models: number

@@ -6,8 +6,10 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"time"
 
 	"cpa-usage-keeper/internal/cpa/dto/apicall"
+	"cpa-usage-keeper/internal/timeutil"
 )
 
 func parseAntigravityQuotaPayload(response *apicall.Response) (*AntigravityQuotaPayload, error) {
@@ -62,6 +64,20 @@ func parseAntigravityQuotaPayload(response *apicall.Response) (*AntigravityQuota
 	return payload, nil
 }
 
+func parseAntigravitySubscriptionPayload(response *apicall.Response) (*AntigravitySubscriptionPayload, error) {
+	object, err := parseResponseObject(response)
+	if err != nil {
+		return nil, err
+	}
+	if nested := objectField(object, "body"); nested != nil {
+		object = nested
+	}
+	return &AntigravitySubscriptionPayload{
+		CurrentTier: parseGeminiCliUserTier(objectField(object, "currentTier", "current_tier")),
+		PaidTier:    parseGeminiCliUserTier(objectField(object, "paidTier", "paid_tier")),
+	}, nil
+}
+
 func parseCodexUsagePayload(response *apicall.Response) (*CodexUsagePayload, error) {
 	object, err := parseResponseObject(response)
 	if err != nil {
@@ -85,6 +101,31 @@ func parseCodexUsagePayload(response *apicall.Response) (*CodexUsagePayload, err
 		})
 	}
 	return payload, nil
+}
+
+func parseCodexSubscriptionActiveUntil(response *apicall.Response) *time.Time {
+	object, err := parseResponseObject(response)
+	if err != nil {
+		return nil
+	}
+	value := stringField(object, "active_until", "activeUntil")
+	if value == "" || value == "0" {
+		return nil
+	}
+	if parsed, err := timeutil.ParseStorageTime(value); err == nil && !parsed.IsZero() {
+		return &parsed
+	}
+	// 官方兼容数字 Unix 时间；毫秒值可由位数区分，零和无效值均不写入。
+	if number, err := strconv.ParseInt(value, 10, 64); err == nil && number > 0 {
+		var parsed time.Time
+		if number >= 100_000_000_000 {
+			parsed = time.UnixMilli(number)
+		} else {
+			parsed = time.Unix(number, 0)
+		}
+		return &parsed
+	}
+	return nil
 }
 
 func parseCodexRateLimitResetCredits(object map[string]json.RawMessage) *CodexRateLimitResetCredits {
@@ -116,13 +157,23 @@ func parseCodexUsageWindow(object map[string]json.RawMessage) *CodexUsageWindow 
 	if object == nil {
 		return nil
 	}
+	// 逐字段保留 presence，历史采集必须区分缺失字段和上游明确返回的零值。
+	usedPercent, hasUsedPercent := floatValue(object, "used_percent", "usedPercent")
+	limitWindowSeconds, hasLimitWindowSeconds := floatValue(object, "limit_window_seconds", "limitWindowSeconds")
+	resetAfterSeconds, hasResetAfterSeconds := floatValue(object, "reset_after_seconds", "resetAfterSeconds")
+	resetAt, hasResetAt := floatValue(object, "reset_at", "resetAt")
 	return &CodexUsageWindow{
-		UsedPercent:        floatField(object, "used_percent", "usedPercent"),
-		LimitWindowSeconds: intField(object, "limit_window_seconds", "limitWindowSeconds"),
-		ResetAfterSeconds:  intField(object, "reset_after_seconds", "resetAfterSeconds"),
-		ResetAt:            intField(object, "reset_at", "resetAt"),
-		WindowUsageTokens:  intPtrField(object, "window_usage_tokens", "windowUsageTokens"),
-		WindowUsageCost:    floatPtrField(object, "window_usage_cost", "windowUsageCost"),
+		// 数值字段保持既有零值/截断语义，presence 字段只为历史提取提供额外事实。
+		UsedPercent:           usedPercent,
+		LimitWindowSeconds:    int64(limitWindowSeconds),
+		ResetAfterSeconds:     int64(resetAfterSeconds),
+		ResetAt:               int64(resetAt),
+		WindowUsageTokens:     intPtrField(object, "window_usage_tokens", "windowUsageTokens"),
+		WindowUsageCost:       floatPtrField(object, "window_usage_cost", "windowUsageCost"),
+		HasUsedPercent:        hasUsedPercent,
+		HasLimitWindowSeconds: hasLimitWindowSeconds,
+		HasResetAfterSeconds:  hasResetAfterSeconds,
+		HasResetAt:            hasResetAt,
 	}
 }
 
@@ -187,6 +238,7 @@ func parseClaudeUsagePayload(response *apicall.Response) (*ClaudeUsagePayload, e
 		return nil, err
 	}
 	return &ClaudeUsagePayload{
+		ResetGrants:       parseClaudeResetGrants(object["cedar_ember"]),
 		FiveHour:          parseClaudeUsageWindow(objectField(object, "five_hour", "fiveHour")),
 		SevenDay:          parseClaudeUsageWindow(objectField(object, "seven_day", "sevenDay")),
 		SevenDayOAuthApps: parseClaudeUsageWindow(objectField(object, "seven_day_oauth_apps", "sevenDayOauthApps")),
@@ -202,9 +254,11 @@ func parseClaudeUsageWindow(object map[string]json.RawMessage) *ClaudeUsageWindo
 	if object == nil {
 		return nil
 	}
+	utilization, hasUtilization := floatValue(object, "utilization")
 	return &ClaudeUsageWindow{
-		Utilization: floatField(object, "utilization"),
-		ResetsAt:    stringField(object, "resets_at", "resetsAt"),
+		Utilization:    utilization,
+		ResetsAt:       stringField(object, "resets_at", "resetsAt"),
+		HasUtilization: hasUtilization && !math.IsNaN(utilization) && !math.IsInf(utilization, 0),
 	}
 }
 
@@ -240,8 +294,8 @@ func parseClaudeProfileAccount(object map[string]json.RawMessage) *ClaudeProfile
 		FullName:     stringField(object, "full_name", "fullName"),
 		DisplayName:  stringField(object, "display_name", "displayName"),
 		Email:        stringField(object, "email"),
-		HasClaudeMax: boolField(object, "has_claude_max", "hasClaudeMax"),
-		HasClaudePro: boolField(object, "has_claude_pro", "hasClaudePro"),
+		HasClaudeMax: boolPtrField(object, "has_claude_max", "hasClaudeMax"),
+		HasClaudePro: boolPtrField(object, "has_claude_pro", "hasClaudePro"),
 	}
 }
 
@@ -266,6 +320,11 @@ func parseKimiUsagePayload(response *apicall.Response) (*KimiUsagePayload, error
 		return nil, err
 	}
 	payload := &KimiUsagePayload{Usage: parseKimiUsageDetail(objectField(object, "usage"))}
+	// 国内与国际 usage 使用同一合同，月度汇总和传统 limits/usage 一次解析。
+	monthly := objectField(objectField(object, "usages"), "limit_month_total")
+	if ratio := floatPtrField(monthly, "used_ratio"); ratio != nil && !math.IsNaN(*ratio) && !math.IsInf(*ratio, 0) && *ratio >= 0 {
+		payload.Usages = &KimiAggregateUsage{MonthTotal: &KimiUsageRatio{UsedRatio: *ratio, ResetTime: stringField(monthly, "reset_time")}}
+	}
 	for _, raw := range arrayField(object, "limits") {
 		limitObject := rawObject(raw)
 		if limitObject == nil {
@@ -661,6 +720,9 @@ func boolField(object map[string]json.RawMessage, keys ...string) bool {
 func boolPtrField(object map[string]json.RawMessage, keys ...string) *bool {
 	for _, key := range keys {
 		if raw, ok := object[key]; ok {
+			if rawJSONNull(raw) {
+				continue
+			}
 			var value bool
 			if err := json.Unmarshal(raw, &value); err == nil {
 				return &value

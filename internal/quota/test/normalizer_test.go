@@ -90,9 +90,6 @@ func TestNormalizeCodexQuotaRows(t *testing.T) {
 	}
 	primary := findQuotaRow(t, rows, "rate_limit.primary_window")
 	assertQuotaText(t, primary, "5h", "window", "")
-	if primary.PlanType != "plus" {
-		t.Fatalf("expected primary planType plus, got %#v", primary.PlanType)
-	}
 	assertFloatField(t, primary.UsedPercent, 25, "primary usedPercent")
 	assertIntField(t, primary.Window.Seconds, 18000, "primary window seconds")
 	assertIntField(t, primary.ResetAfterSeconds, 1200, "primary resetAfterSeconds")
@@ -109,9 +106,6 @@ func TestNormalizeCodexQuotaRows(t *testing.T) {
 	assertQuotaText(t, codeReview, "Code Review 5h", "code_review", "")
 	additional := findQuotaRow(t, rows, "additional_rate_limits.codex-spark.primary_window")
 	assertQuotaText(t, additional, "codex-spark 5h", "additional", "spark")
-	if additional.PlanType != "plus" {
-		t.Fatalf("expected additional planType plus, got %#v", additional.PlanType)
-	}
 	assertFloatField(t, additional.UsedPercent, 12, "additional usedPercent")
 }
 
@@ -294,6 +288,21 @@ func TestNormalizeAntigravityQuotaRowsScopesDuplicateBucketIDsByStableGroup(t *t
 	}
 }
 
+func TestNormalizeAntigravityQuotaRowsCanonicalizesKnownGroupLabelVariants(t *testing.T) {
+	remaining := 0.5
+	rows := quota.NormalizeQuotaRows(quota.ProviderOutput{Provider: "antigravity", Result: quota.AntigravityResult{Quota: &quota.AntigravityQuotaPayload{Groups: []quota.AntigravityQuotaGroup{
+		{DisplayName: "Gemini models", Buckets: []quota.AntigravityQuotaBucket{{BucketID: "gemini", Window: "5h", RemainingFraction: &remaining}}},
+		{DisplayName: "Claude & GPT Models", Buckets: []quota.AntigravityQuotaBucket{{BucketID: "claude-gpt", Window: "5h", RemainingFraction: &remaining}}},
+	}}}})
+
+	if len(rows) != 2 {
+		t.Fatalf("expected two canonical Antigravity groups, got %#v", rows)
+	}
+	if rows[0].GroupKey != "antigravity-gemini-models" || rows[1].GroupKey != "antigravity-claude-and-gpt-models" {
+		t.Fatalf("expected display-name variants to use canonical usage group keys, got %#v", rows)
+	}
+}
+
 func TestNormalizeKimiQuotaRows(t *testing.T) {
 	rows := quota.NormalizeQuotaRows(quota.ProviderOutput{Provider: "kimi", Result: quota.KimiResult{Usage: &quota.KimiUsagePayload{
 		Usage: &quota.KimiUsageDetail{Used: 3, Limit: 10, Remaining: 7, Name: "monthly", Title: "Monthly", ResetAt: "2026-05-09T12:00:00Z", ResetIn: 3600},
@@ -402,57 +411,49 @@ func TestNormalizeXAIProductRowsUsesStableKeysDeduplicationAndSorting(t *testing
 		}},
 	}})
 
-	if len(rows) != 3 {
-		t.Fatalf("expected weekly plus two product rows, got %#v", rows)
+	if len(rows) != 1 || rows[0].Key != "billing.weekly" {
+		t.Fatalf("expected only shared weekly quota, got %#v", rows)
 	}
-	if rows[0].Key != "billing.weekly" || rows[1].Key != "billing.weekly.product.grok+4" || rows[2].Key != "billing.weekly.product.grok+code" {
-		t.Fatalf("unexpected product row order or keys: %#v", rows)
+	parts := rows[0].UsageBreakdown
+	if len(parts) != 3 || parts[0].Product != "grok 4" || parts[1].Product != "Grok Code" || parts[2].Product != "No Data" {
+		t.Fatalf("unexpected breakdown: %#v", parts)
 	}
-	assertQuotaText(t, rows[1], "grok 4 Usage", "product", "grok 4")
-	assertFloatField(t, rows[1].UsedPercent, 100, "grok 4 usedPercent")
-	if rows[1].LimitReached == nil || !*rows[1].LimitReached {
-		t.Fatalf("expected grok 4 product quota to be reached: %#v", rows[1])
+	assertFloatField(t, parts[0].UsedPercent, 100, "product used percent")
+	assertFloatField(t, parts[1].UsedPercent, 90, "deduplicated product used percent")
+	if parts[2].UsedPercent != nil {
+		t.Fatal("missing usage must stay unknown")
 	}
-	assertQuotaText(t, rows[2], "Grok Code Usage", "product", "Grok Code")
-	assertFloatField(t, rows[2].UsedPercent, 90, "deduplicated grok code usedPercent")
-	assertIntField(t, rows[2].Window.Seconds, 604800, "product weekly window seconds")
-	if rows[2].ResetAt != "2026-07-13T00:00:00Z" {
-		t.Fatalf("unexpected product resetAt: %#v", rows[2])
+	if rows[0].LimitReached == nil || *rows[0].LimitReached {
+		t.Fatal("product usage must not mark shared quota exhausted")
 	}
+
 }
 
-func TestNormalizeXAIDerivesPayAsYouGoUsageFromTotalSpend(t *testing.T) {
-	rows := quota.NormalizeQuotaRows(quota.ProviderOutput{Provider: "xai", Result: quota.XAIResult{
-		Monthly: &quota.XAIBillingPayload{Config: &quota.XAIBillingConfig{
-			MonthlyLimit: quota.XAIMoneyValue{Val: floatPtr(1000)},
-			Used:         quota.XAIMoneyValue{Val: floatPtr(1300)},
-			OnDemandCap:  quota.XAIMoneyValue{Val: floatPtr(500)},
-		}},
-	}})
-
-	monthly := findQuotaRow(t, rows, "billing.monthly")
-	if monthly.LimitReached == nil || *monthly.LimitReached {
-		t.Fatalf("monthly included spend must remain allowed while PAYG is available: %#v", monthly)
-	}
-	onDemand := findQuotaRow(t, rows, "billing.on_demand")
-	assertFloatField(t, onDemand.Used, 300, "derived pay-as-you-go used")
-	assertFloatField(t, onDemand.Remaining, 200, "derived pay-as-you-go remaining")
-	assertFloatField(t, onDemand.UsedPercent, 60, "derived pay-as-you-go usedPercent")
-}
-
-func TestNormalizeXAIQuotaRowsMarksPayAsYouGoExhaustion(t *testing.T) {
-	rows := quota.NormalizeQuotaRows(quota.ProviderOutput{Provider: "xai", Result: quota.XAIResult{
-		Monthly: &quota.XAIBillingPayload{Config: &quota.XAIBillingConfig{
-			MonthlyLimit: quota.XAIMoneyValue{Val: floatPtr(1000)},
-			Used:         quota.XAIMoneyValue{Val: floatPtr(1500)},
-			OnDemandCap:  quota.XAIMoneyValue{Val: floatPtr(500)},
-		}},
-	}})
-
-	monthly := findQuotaRow(t, rows, "billing.monthly")
-	onDemand := findQuotaRow(t, rows, "billing.on_demand")
-	if monthly.LimitReached == nil || !*monthly.LimitReached || onDemand.LimitReached == nil || !*onDemand.LimitReached {
-		t.Fatalf("expected exhausted included and PAYG rows to be limit reached: %#v", rows)
+func TestNormalizeXAIDerivesPayAsYouGoUsageAndExhaustion(t *testing.T) {
+	for _, tc := range []struct {
+		name                            string
+		total, used, remaining, percent float64
+		exhausted                       bool
+	}{
+		{"available", 1300, 300, 200, 60, false},
+		{"exhausted", 1500, 500, 0, 100, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rows := quota.NormalizeQuotaRows(quota.ProviderOutput{Provider: "xai", Result: quota.XAIResult{
+				Monthly: &quota.XAIBillingPayload{Config: &quota.XAIBillingConfig{
+					MonthlyLimit: quota.XAIMoneyValue{Val: new(float64(1000))},
+					Used:         quota.XAIMoneyValue{Val: &tc.total},
+					OnDemandCap:  quota.XAIMoneyValue{Val: new(float64(500))},
+				}},
+			}})
+			monthly := findQuotaRow(t, rows, "billing.monthly")
+			onDemand := findQuotaRow(t, rows, "billing.on_demand")
+			assertBoolField(t, monthly.LimitReached, tc.exhausted, "monthly exhausted")
+			assertBoolField(t, onDemand.LimitReached, tc.exhausted, "PAYG exhausted")
+			assertFloatField(t, onDemand.Used, tc.used, "derived PAYG used")
+			assertFloatField(t, onDemand.Remaining, tc.remaining, "derived PAYG remaining")
+			assertFloatField(t, onDemand.UsedPercent, tc.percent, "derived PAYG usedPercent")
+		})
 	}
 }
 
@@ -492,5 +493,12 @@ func assertBoolField(t *testing.T, value *bool, expected bool, label string) {
 	t.Helper()
 	if value == nil || *value != expected {
 		t.Fatalf("unexpected %s: got %#v want %v", label, value, expected)
+	}
+}
+
+func TestNormalizeXAIProductUsageWithoutTotal(t *testing.T) {
+	rows := quota.NormalizeQuotaRows(quota.ProviderOutput{Result: quota.XAIResult{Weekly: &quota.XAIBillingPayload{Config: &quota.XAIBillingConfig{ProductUsage: []quota.XAIBillingProductUsage{{Product: "GrokBuild", UsagePercent: floatPtr(14)}, {Product: "GrokChat"}}}}}})
+	if len(rows) != 1 || len(rows[0].UsageBreakdown) != 2 || rows[0].UsedPercent != nil || rows[0].LimitReached != nil || rows[0].Allowed != nil {
+		t.Fatalf("must preserve partial details without deriving quota: %#v", rows)
 	}
 }

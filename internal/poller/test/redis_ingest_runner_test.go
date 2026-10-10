@@ -14,24 +14,26 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-func TestRedisIngestRunnerStartupFallsBackToHTTPPull(t *testing.T) {
+func TestRedisIngestRunnerNotifiesMetadataOnInitialConnectionOnce(t *testing.T) {
+	observer := &controlObserverStub{}
 	writer := newFakeInboxWriter()
 	runner := poller.NewRedisIngestRunner(
 		fakeSubscribeSource{err: errors.New("subscribe unavailable")},
 		&fakePullSource{err: errors.New("redis unavailable")},
-		&fakePullSource{batches: [][]string{{`{"request_id":"http"}`}}},
+		&fakePullSource{batches: [][]string{{`{"request_id":"http"}`}, {`{"request_id":"http-next"}`}}},
 		writer,
-		poller.RedisIngestRunnerConfig{IdleInterval: 10 * time.Millisecond, BatchSize: 10, HTTPBackoffInitial: 10 * time.Millisecond, HTTPBackoffMax: 10 * time.Millisecond},
+		poller.RedisIngestRunnerConfig{IdleInterval: time.Millisecond, BatchSize: 10, HTTPBackoffInitial: time.Millisecond, HTTPBackoffMax: time.Millisecond},
 	)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go func() { _ = runner.Run(ctx) }()
+	runner.SetControlMessageObserver(observer)
+	stop := startRedisIngestTestRunner(t, runner)
 
-	entry := writer.waitForInsert(t)
-	cancel()
-	if entry.source != poller.RedisIngestSourceHTTPPull {
-		t.Fatalf("expected HTTP source, got %q", entry.source)
+	for range 2 {
+		if entry := writer.waitForInsert(t); entry.source != poller.RedisIngestSourceHTTPPull {
+			t.Fatalf("expected HTTP source, got %q", entry.source)
+		}
 	}
+	stop()
+	waitForConnected(t, observer, 1)
 }
 
 func TestRedisIngestRunnerStartupAllFailedUsesTenSecondInitialRetry(t *testing.T) {
@@ -43,27 +45,17 @@ func TestRedisIngestRunnerStartupAllFailedUsesTenSecondInitialRetry(t *testing.T
 		newFakeInboxWriter(),
 		poller.RedisIngestRunnerConfig{IdleInterval: 10 * time.Millisecond, BatchSize: 10},
 	)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	done := make(chan struct{})
-	go func() {
-		_ = runner.Run(ctx)
-		close(done)
-	}()
+	stop := startRedisIngestTestRunner(t, runner)
 
 	output := waitForLogContains(t, logs, "redis ingest startup retry scheduled", "retry_after=10s")
-	cancel()
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for runner to stop")
-	}
+	stop()
 	if !strings.Contains(output, "startup_failed") {
 		t.Fatalf("expected startup failure before retry schedule, got logs: %s", output)
 	}
 }
 
 func TestRedisIngestRunnerSubscribeBackfillsBeforeReceiving(t *testing.T) {
+	observer := &controlObserverStub{}
 	writer := newFakeInboxWriter()
 	sub := &blockingSubscription{messages: make(chan string)}
 	runner := poller.NewRedisIngestRunner(
@@ -71,17 +63,17 @@ func TestRedisIngestRunnerSubscribeBackfillsBeforeReceiving(t *testing.T) {
 		&fakePullSource{batches: [][]string{{`{"request_id":"redis-backfill"}`}}},
 		&fakePullSource{},
 		writer,
-		poller.RedisIngestRunnerConfig{IdleInterval: 10 * time.Millisecond, BatchSize: 10, HTTPBackoffInitial: 10 * time.Millisecond, HTTPBackoffMax: 10 * time.Millisecond},
+		redisIngestTestConfig(10),
 	)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go func() { _ = runner.Run(ctx) }()
+	runner.SetControlMessageObserver(observer)
+	stop := startRedisIngestTestRunner(t, runner)
 
 	entry := writer.waitForInsert(t)
-	cancel()
+	stop()
 	if entry.source != poller.RedisIngestSourceRedisPull {
 		t.Fatalf("expected Redis backfill source, got %q", entry.source)
 	}
+	waitForConnected(t, observer, 1)
 }
 
 func TestRedisIngestRunnerWritesDynamicPullSourceName(t *testing.T) {
@@ -95,14 +87,12 @@ func TestRedisIngestRunnerWritesDynamicPullSourceName(t *testing.T) {
 		redisSource,
 		&fakePullSource{},
 		writer,
-		poller.RedisIngestRunnerConfig{IdleInterval: 10 * time.Millisecond, BatchSize: 10, HTTPBackoffInitial: 10 * time.Millisecond, HTTPBackoffMax: 10 * time.Millisecond},
+		redisIngestTestConfig(10),
 	)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go func() { _ = runner.Run(ctx) }()
+	stop := startRedisIngestTestRunner(t, runner)
 
 	entry := writer.waitForInsert(t)
-	cancel()
+	stop()
 	if entry.source != "redis_pull:queue" {
 		t.Fatalf("expected dynamic Redis pull source, got %q", entry.source)
 	}
@@ -119,15 +109,13 @@ func TestRedisIngestRunnerSubscribeBackfillDrainsRedisBeforeReceiving(t *testing
 		}},
 		&fakePullSource{},
 		writer,
-		poller.RedisIngestRunnerConfig{IdleInterval: 10 * time.Millisecond, BatchSize: 1, HTTPBackoffInitial: 10 * time.Millisecond, HTTPBackoffMax: 10 * time.Millisecond},
+		redisIngestTestConfig(1),
 	)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go func() { _ = runner.Run(ctx) }()
+	stop := startRedisIngestTestRunner(t, runner)
 
 	first := writer.waitForInsert(t)
 	second := writer.waitForInsert(t)
-	cancel()
+	stop()
 	if first.source != poller.RedisIngestSourceRedisPull || second.source != poller.RedisIngestSourceRedisPull {
 		t.Fatalf("expected Redis backfill source for both batches, got %q and %q", first.source, second.source)
 	}
@@ -145,14 +133,12 @@ func TestRedisIngestRunnerSubscribeBackfillContinuesAfterFullControlOnlyBatch(t 
 		}},
 		&fakePullSource{},
 		writer,
-		poller.RedisIngestRunnerConfig{IdleInterval: 10 * time.Millisecond, BatchSize: 1, HTTPBackoffInitial: 10 * time.Millisecond, HTTPBackoffMax: 10 * time.Millisecond},
+		redisIngestTestConfig(1),
 	)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go func() { _ = runner.Run(ctx) }()
+	stop := startRedisIngestTestRunner(t, runner)
 
 	entry := delegate.waitForInsert(t)
-	cancel()
+	stop()
 	if entry.source != poller.RedisIngestSourceRedisPull {
 		t.Fatalf("expected Redis backfill source, got %q", entry.source)
 	}
@@ -174,16 +160,14 @@ func TestRedisIngestRunnerSubscribeBackfillStopsAfterPartialControlOnlyBatch(t *
 		redisSource,
 		&fakePullSource{},
 		writer,
-		poller.RedisIngestRunnerConfig{IdleInterval: 10 * time.Millisecond, BatchSize: 10, HTTPBackoffInitial: 10 * time.Millisecond, HTTPBackoffMax: 10 * time.Millisecond},
+		redisIngestTestConfig(10),
 	)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go func() { _ = runner.Run(ctx) }()
+	stop := startRedisIngestTestRunner(t, runner)
 
 	_ = waitForStatus(t, runner, func(status poller.Status) bool {
 		return status.LastStatus == "subscribing"
 	})
-	cancel()
+	stop()
 	if calls := redisSource.callCount(); calls != 1 {
 		t.Fatalf("expected backfill to stop after partial control-only batch, got %d calls", calls)
 	}
@@ -198,15 +182,13 @@ func TestRedisIngestRunnerInfoLogsSubscribeBackfillOnce(t *testing.T) {
 		&fakePullSource{batches: [][]string{{`{"request_id":"redis-backfill"}`}}},
 		&fakePullSource{},
 		writer,
-		poller.RedisIngestRunnerConfig{IdleInterval: 10 * time.Millisecond, BatchSize: 10, HTTPBackoffInitial: 10 * time.Millisecond, HTTPBackoffMax: 10 * time.Millisecond},
+		redisIngestTestConfig(10),
 	)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go func() { _ = runner.Run(ctx) }()
+	stop := startRedisIngestTestRunner(t, runner)
 
 	_ = writer.waitForInsert(t)
 	output := waitForLogContains(t, logs, "redis subscribe backfill used redis pull")
-	cancel()
+	stop()
 	if strings.Contains(output, "redis ingest pulled usage messages") {
 		t.Fatalf("expected per-pull loop counts to stay below info level, got logs: %s", output)
 	}
@@ -221,27 +203,23 @@ func TestRedisIngestRunnerDebugLogsSubscribeMessageCounts(t *testing.T) {
 		&fakePullSource{},
 		&fakePullSource{},
 		writer,
-		poller.RedisIngestRunnerConfig{IdleInterval: 10 * time.Millisecond, BatchSize: 1, HTTPBackoffInitial: 10 * time.Millisecond, HTTPBackoffMax: 10 * time.Millisecond},
+		redisIngestTestConfig(1),
 	)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go func() { _ = runner.Run(ctx) }()
+	stop := startRedisIngestTestRunner(t, runner)
 
 	sub.messages <- `{"request_id":"subscribe"}`
 	entry := writer.waitForInsert(t)
-	output := waitForLogContains(t, logs, "redis subscribe messages received", "message_count=1", "inserted_count=1")
-	cancel()
+	waitForLogContains(t, logs, "redis subscribe messages received", "message_count=1", "inserted_count=1")
+	stop()
 	if entry.source != poller.RedisIngestSourceSubscribe {
 		t.Fatalf("expected subscribe source, got %q", entry.source)
-	}
-	if !strings.Contains(output, "redis subscribe messages received") || !strings.Contains(output, "message_count=1") || !strings.Contains(output, "inserted_count=1") {
-		t.Fatalf("expected subscribe debug receive counts, got logs: %s", output)
 	}
 }
 
 func TestRedisIngestRunnerInfoLogsHTTPRecovery(t *testing.T) {
 	logs := capturePollerLogs(t, logrus.InfoLevel)
 	writer := newFakeInboxWriter()
+	observer := &controlObserverStub{}
 	httpSource := &fakePullSource{
 		errs: []error{
 			nil,
@@ -259,21 +237,21 @@ func TestRedisIngestRunnerInfoLogsHTTPRecovery(t *testing.T) {
 		&fakePullSource{err: errors.New("redis unavailable")},
 		httpSource,
 		writer,
-		poller.RedisIngestRunnerConfig{IdleInterval: 10 * time.Millisecond, BatchSize: 10, HTTPBackoffInitial: 10 * time.Millisecond, HTTPBackoffMax: 10 * time.Millisecond},
+		redisIngestTestConfig(10),
 	)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go func() { _ = runner.Run(ctx) }()
+	runner.SetControlMessageObserver(observer)
+	stop := startRedisIngestTestRunner(t, runner)
 
 	initial := writer.waitForInsert(t)
 	if initial.source != poller.RedisIngestSourceHTTPPull {
 		t.Fatalf("expected initial HTTP source, got %q", initial.source)
 	}
 	recovered := writer.waitForInsert(t)
-	cancel()
+	stop()
 	if recovered.source != poller.RedisIngestSourceHTTPPull {
 		t.Fatalf("expected recovered HTTP source, got %q", recovered.source)
 	}
+	waitForConnected(t, observer, 2)
 	output := waitForLogContains(t, logs, "redis ingest recovered", "http_pull_recovered")
 	if !strings.Contains(output, "http failed once") || !strings.Contains(output, "http failed twice") {
 		t.Fatalf("expected HTTP failures before recovery, got logs: %s", output)
@@ -288,22 +266,21 @@ func TestRedisIngestRunnerSubscribeReceivingReportsSyncRunning(t *testing.T) {
 		&fakePullSource{},
 		&fakePullSource{},
 		writer,
-		poller.RedisIngestRunnerConfig{IdleInterval: 10 * time.Millisecond, BatchSize: 10, HTTPBackoffInitial: 10 * time.Millisecond, HTTPBackoffMax: 10 * time.Millisecond},
+		redisIngestTestConfig(10),
 	)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go func() { _ = runner.Run(ctx) }()
+	stop := startRedisIngestTestRunner(t, runner)
 
 	status := waitForStatus(t, runner, func(status poller.Status) bool {
 		return status.LastStatus == "subscribing"
 	})
-	cancel()
+	stop()
 	if !status.SyncRunning {
 		t.Fatalf("expected sync_running while subscribe is waiting, got status: %+v", status)
 	}
 }
 
 func TestRedisIngestRunnerRedisPullRecoveryClearsStatusError(t *testing.T) {
+	observer := &controlObserverStub{}
 	writer := newFakeInboxWriter()
 	redisSource := &fakePullSource{
 		errs: []error{
@@ -321,11 +298,10 @@ func TestRedisIngestRunnerRedisPullRecoveryClearsStatusError(t *testing.T) {
 		redisSource,
 		&fakePullSource{err: errors.New("http failed")},
 		writer,
-		poller.RedisIngestRunnerConfig{IdleInterval: 10 * time.Millisecond, BatchSize: 10, HTTPBackoffInitial: 10 * time.Millisecond, HTTPBackoffMax: 10 * time.Millisecond},
+		redisIngestTestConfig(10),
 	)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go func() { _ = runner.Run(ctx) }()
+	runner.SetControlMessageObserver(observer)
+	stop := startRedisIngestTestRunner(t, runner)
 
 	initial := writer.waitForInsert(t)
 	if initial.source != poller.RedisIngestSourceRedisPull {
@@ -340,21 +316,22 @@ func TestRedisIngestRunnerRedisPullRecoveryClearsStatusError(t *testing.T) {
 	_ = waitForStatus(t, runner, func(status poller.Status) bool {
 		return status.LastError == "" && status.LastWarning == "" && status.SyncRunning
 	})
-	cancel()
+	waitForConnected(t, observer, 2)
+	stop()
 }
 
 func TestRedisIngestRunnerDegradedHTTPSuccessClearsStatusError(t *testing.T) {
+	observer := &controlObserverStub{}
 	writer := newFakeInboxWriter()
 	runner := poller.NewRedisIngestRunner(
 		fakeSubscribeSource{sub: failingSubscription{err: io.EOF}},
-		&fakePullSource{errs: []error{nil, errors.New("redis unavailable")}},
+		&fakePullSource{errs: []error{nil, errors.New("redis unavailable"), errors.New("redis unavailable"), errors.New("redis unavailable")}},
 		&fakePullSource{batches: [][]string{{`{"request_id":"http-fallback"}`}}},
 		writer,
-		poller.RedisIngestRunnerConfig{IdleInterval: 10 * time.Millisecond, BatchSize: 10, HTTPBackoffInitial: 10 * time.Millisecond, HTTPBackoffMax: 10 * time.Millisecond},
+		redisIngestTestConfig(10),
 	)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go func() { _ = runner.Run(ctx) }()
+	runner.SetControlMessageObserver(observer)
+	stop := startRedisIngestTestRunner(t, runner)
 
 	entry := writer.waitForInsert(t)
 	if entry.source != poller.RedisIngestSourceHTTPPull {
@@ -363,7 +340,35 @@ func TestRedisIngestRunnerDegradedHTTPSuccessClearsStatusError(t *testing.T) {
 	_ = waitForStatus(t, runner, func(status poller.Status) bool {
 		return status.LastError == "" && status.LastWarning == "" && status.SyncRunning
 	})
-	cancel()
+	waitForConnected(t, observer, 2)
+	stop()
+}
+
+func TestRedisIngestRunnerNotifiesMetadataAfterHTTPFallbackRecovery(t *testing.T) {
+	observer := &controlObserverStub{}
+	writer := newFakeInboxWriter()
+	redisSource := &fakePullSource{
+		errs:    []error{nil, errors.New("redis failed"), errors.New("redis failed")},
+		batches: [][]string{{`{"request_id":"redis-initial"}`}},
+	}
+	httpSource := &fakePullSource{
+		errs:    []error{nil, errors.New("http degraded failure"), nil},
+		batches: [][]string{{`{"request_id":"http-fallback"}`}, {`{"request_id":"http-recovered"}`}},
+	}
+	runner := poller.NewRedisIngestRunner(
+		fakeSubscribeSource{err: errors.New("subscribe unavailable")},
+		redisSource,
+		httpSource,
+		writer,
+		poller.RedisIngestRunnerConfig{IdleInterval: time.Millisecond, BatchSize: 10, HTTPBackoffInitial: time.Millisecond, HTTPBackoffMax: time.Millisecond},
+	)
+	runner.SetControlMessageObserver(observer)
+	stop := startRedisIngestTestRunner(t, runner)
+
+	_ = writer.waitForInsert(t)
+	_ = writer.waitForInsert(t)
+	waitForConnected(t, observer, 3)
+	stop()
 }
 
 func TestRedisIngestRunnerMarksMetadataPollingRequiredOnSubscribeDisconnect(t *testing.T) {
@@ -373,26 +378,17 @@ func TestRedisIngestRunnerMarksMetadataPollingRequiredOnSubscribeDisconnect(t *t
 		&fakePullSource{},
 		&fakePullSource{},
 		newFakeInboxWriter(),
-		poller.RedisIngestRunnerConfig{IdleInterval: 10 * time.Millisecond, BatchSize: 10, HTTPBackoffInitial: 10 * time.Millisecond, HTTPBackoffMax: 10 * time.Millisecond},
+		redisIngestTestConfig(10),
 	)
 	runner.SetControlMessageObserver(observer)
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		_ = runner.Run(ctx)
-		close(done)
-	}()
+	stop := startRedisIngestTestRunner(t, runner)
 
 	_ = waitForStatus(t, runner, func(status poller.Status) bool {
 		return status.LastStatus == "subscribe_degraded_polling" || strings.Contains(status.LastError, "EOF")
 	})
-	cancel()
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for runner to stop")
-	}
-	if observer.polling == 0 {
+	stop()
+	_, _, _, polling := observer.counts()
+	if polling == 0 {
 		t.Fatal("expected subscribe disconnect to restore metadata polling")
 	}
 }
@@ -406,17 +402,15 @@ func TestRedisIngestRunnerInboxWriteFailureDoesNotConsumeFallbackSource(t *testi
 		&fakePullSource{batches: [][]string{{`{"request_id":"redis-consumed-before-write-failed"}`}}},
 		httpSource,
 		writer,
-		poller.RedisIngestRunnerConfig{IdleInterval: 10 * time.Millisecond, BatchSize: 10, HTTPBackoffInitial: 10 * time.Millisecond, HTTPBackoffMax: 10 * time.Millisecond},
+		redisIngestTestConfig(10),
 	)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go func() { _ = runner.Run(ctx) }()
+	stop := startRedisIngestTestRunner(t, runner)
 
 	attempt := writer.waitForAttempt(t)
 	if attempt.source != poller.RedisIngestSourceRedisPull {
 		t.Fatalf("expected failed write attempt from Redis source, got %q", attempt.source)
 	}
-	cancel()
+	stop()
 	if calls := httpSource.callCount(); calls != 0 {
 		t.Fatalf("expected writer failure not to consume HTTP fallback source, got %d calls", calls)
 	}
@@ -431,14 +425,12 @@ func TestRedisIngestRunnerDebugLogsPullSourceAndCounts(t *testing.T) {
 		&fakePullSource{batches: [][]string{{`{"request_id":"redis-backfill"}`}}},
 		&fakePullSource{},
 		writer,
-		poller.RedisIngestRunnerConfig{IdleInterval: 10 * time.Millisecond, BatchSize: 10, HTTPBackoffInitial: 10 * time.Millisecond, HTTPBackoffMax: 10 * time.Millisecond},
+		redisIngestTestConfig(10),
 	)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go func() { _ = runner.Run(ctx) }()
+	stop := startRedisIngestTestRunner(t, runner)
 
 	_ = writer.waitForInsert(t)
-	cancel()
+	stop()
 	output := logs.String()
 	if !strings.Contains(output, "redis ingest pulled usage messages") || !strings.Contains(output, `source="`+poller.RedisIngestSourceRedisPull+`"`) || !strings.Contains(output, "message_count=1") {
 		t.Fatalf("expected debug pull source and count logs, got logs: %s", output)
@@ -451,10 +443,7 @@ type fakeSubscribeSource struct {
 }
 
 func (s fakeSubscribeSource) Subscribe(context.Context) (poller.UsageSubscription, error) {
-	if s.err != nil {
-		return nil, s.err
-	}
-	return s.sub, nil
+	return s.sub, s.err
 }
 
 type blockingSubscription struct {
@@ -529,8 +518,6 @@ type fakeInboxInsert struct {
 }
 
 type fakeInboxWriter struct {
-	mu       sync.Mutex
-	inserts  []fakeInboxInsert
 	attempts chan fakeInboxInsert
 	ch       chan fakeInboxInsert
 	err      error
@@ -546,9 +533,6 @@ func (w *fakeInboxWriter) Insert(_ context.Context, source string, messages []st
 	if w.err != nil {
 		return 0, w.err
 	}
-	w.mu.Lock()
-	w.inserts = append(w.inserts, entry)
-	w.mu.Unlock()
 	w.ch <- entry
 	return len(messages), nil
 }
@@ -575,16 +559,6 @@ func (w *fakeInboxWriter) waitForInsert(t *testing.T) fakeInboxInsert {
 	}
 }
 
-func (w *fakeInboxWriter) lastInsert(t *testing.T) fakeInboxInsert {
-	t.Helper()
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if len(w.inserts) == 0 {
-		t.Fatal("expected at least one insert")
-	}
-	return w.inserts[len(w.inserts)-1]
-}
-
 func waitForStatus(t *testing.T, runner *poller.RedisIngestRunner, match func(poller.Status) bool) poller.Status {
 	t.Helper()
 	deadline := time.After(time.Second)
@@ -599,6 +573,27 @@ func waitForStatus(t *testing.T, runner *poller.RedisIngestRunner, match func(po
 		case <-deadline:
 			t.Fatalf("timed out waiting for status, got: %+v", status)
 			return status
+		case <-tick.C:
+		}
+	}
+}
+
+func waitForConnected(t *testing.T, observer *controlObserverStub, expected int) {
+	t.Helper()
+	deadline := time.After(time.Second)
+	tick := time.NewTicker(time.Millisecond)
+	defer tick.Stop()
+	for {
+		connected, _, _, _ := observer.counts()
+		if connected >= expected {
+			if connected != expected {
+				t.Fatalf("connection notifications = %d, want %d", connected, expected)
+			}
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for %d connection notifications, got %d", expected, connected)
 		case <-tick.C:
 		}
 	}
@@ -662,4 +657,29 @@ func capturePollerLogs(t *testing.T, level logrus.Level) *lockedLogBuffer {
 		logrus.SetLevel(previousLevel)
 	})
 	return logs
+}
+
+func redisIngestTestConfig(batchSize int) poller.RedisIngestRunnerConfig {
+	return poller.RedisIngestRunnerConfig{IdleInterval: 10 * time.Millisecond, BatchSize: batchSize, HTTPBackoffInitial: 10 * time.Millisecond, HTTPBackoffMax: 10 * time.Millisecond}
+}
+
+func startRedisIngestTestRunner(t *testing.T, runner *poller.RedisIngestRunner) func() {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = runner.Run(ctx)
+	}()
+	stop := func() {
+		t.Helper()
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for runner to stop")
+		}
+	}
+	t.Cleanup(stop)
+	return stop
 }

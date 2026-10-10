@@ -1,4 +1,4 @@
-import { type AnalysisLatencyDiagnostics, type AnalysisResponse, type AuthFilesManagementResponse, type AuthManagedSessionsResponse, type AuthSessionResponse, type CpaApiKeyDisplayItem, type CpaApiKeyOptionsResponse, type CpaApiKeySettingsResponse, type CpaApiKeysResponse, type OverviewRealtimeBlock, type OverviewRealtimeWindow, type PricingEntry, type PricingResponse, type PricingRulesResponse, type PricingSyncPreviewResponse, type QuotaAutoRefreshSettings, type ReplacePricingRulesRequest, type StatusResponse, type UpdateCheckResponse, type UsageActivityRequest, type UsageActivityResponse, type UsageEventModelFilterOptionsResponse, type UsageEventRequestLogResponse, type UsageEventSourceFilterOptionsResponse, type UsageRangeRequest, type UsedModelsResponse, type UsageIdentitiesPageResponse, type UsageIdentitiesResponse, type UsageEventsResponse, type UsageIdentity, type UsageIdentityAuthType, type UsageOverviewResponse, type UsageQuotaCacheResponse, type UsageQuotaInspectionStatusResponse, type UsageQuotaRefreshResponse, type UsageQuotaRefreshTaskResponse, type UsageQuotaResetCreditsResponse, type UsageQuotaResetResponse, type VersionResponse } from './types'
+import { type AnalysisLatencyDiagnostics, type AnalysisResponse, type AuthFilesManagementResponse, type AuthManagedSessionsResponse, type AuthSessionResponse, type CodexQuotaHistoryResponse, type CpaApiKeyDisplayItem, type CpaApiKeyOptionsResponse, type CpaApiKeySettingsResponse, type CpaApiKeysResponse, type ErrorEventsResponse, type OverviewRealtimeBlock, type OverviewRealtimeWindow, type PricingEntry, type PricingResponse, type PricingRulesResponse, type PricingSyncPreviewResponse, type PricingSyncSource, type QuotaAutoRefreshSettings, type ReplacePricingRulesRequest, type StatusResponse, type UpdateCheckResponse, type UsageActivityRequest, type UsageActivityResponse, type UsageEventModelFilterOptionsResponse, type UsageEventRequestLogResponse, type UsageEventSourceFilterOptionsResponse, type UsageRangeRequest, type UsedModelsResponse, type UsageIdentitiesPageResponse, type UsageIdentitiesResponse, type UsageEventsResponse, type UsageIdentity, type UsageIdentityAuthType, type UsageOverviewComparisons, type UsageOverviewResponse, type UsageQuotaCacheResponse, type UsageQuotaInspectionStatusResponse, type UsageQuotaRefreshResponse, type UsageQuotaRefreshTaskResponse, type UsageQuotaResetCreditsResponse, type UsageQuotaResetResponse, type VersionResponse } from './types'
 import { isCPAMCEmbed } from '@/embed/cpamcEmbed'
 import { resolveUsageRequestRange } from '@/utils/usage/rangeQuery'
 
@@ -39,45 +39,29 @@ function realtimeBucketSecondsForWindow(window: OverviewRealtimeWindow): number 
   return 30
 }
 
-function realtimeResponseParticleTotal(particles: OverviewRealtimeBlock['response_distribution']['ttft']['particles']): number {
-  return particles.reduce((total, particle) => total + Math.max(1, Number(particle.count) || 0), 0)
-}
-
 function normalizeOverviewRealtimeBlock(
   block: Partial<OverviewRealtimeBlock> & {
     current_usage?: Partial<OverviewRealtimeBlock['current_usage']>;
-    response_distribution?: Partial<OverviewRealtimeBlock['response_distribution']>;
   },
   fallbackWindow?: OverviewRealtimeWindow,
 ): OverviewRealtimeBlock {
   const currentUsage: Partial<OverviewRealtimeBlock['current_usage']> = block.current_usage ?? {}
-  const responseDistribution: Partial<OverviewRealtimeBlock['response_distribution']> = block.response_distribution ?? {}
-  const ttftParticles = responseDistribution.ttft?.particles ?? []
-  const latencyParticles = responseDistribution.latency?.particles ?? []
   const resolvedWindow = block.window ?? fallbackWindow ?? '15m'
   return {
     window: resolvedWindow,
+    insights: block.insights,
     timezone: block.timezone,
     bucket_seconds: block.bucket_seconds ?? realtimeBucketSecondsForWindow(resolvedWindow),
     window_start: block.window_start,
     window_end: block.window_end,
     token_velocity: block.token_velocity ?? [],
-    response_level: block.response_level ?? [],
-    response_distribution: {
-      ttft: {
-        average_line: responseDistribution.ttft?.average_line ?? [],
-        particles: ttftParticles,
-        total_particles: responseDistribution.ttft?.total_particles ?? realtimeResponseParticleTotal(ttftParticles),
-        sampled: responseDistribution.ttft?.sampled ?? false,
-        max_particles: responseDistribution.ttft?.max_particles ?? 1000,
-      },
-      latency: {
-        average_line: responseDistribution.latency?.average_line ?? [],
-        particles: latencyParticles,
-        total_particles: responseDistribution.latency?.total_particles ?? realtimeResponseParticleTotal(latencyParticles),
-        sampled: responseDistribution.latency?.sampled ?? false,
-        max_particles: responseDistribution.latency?.max_particles ?? 1000,
-      },
+    latency_scatter: {
+      points: block.latency_scatter?.points ?? [],
+      total_points: block.latency_scatter?.total_points ?? 0,
+      p95_ttft_ms: block.latency_scatter?.p95_ttft_ms ?? 0,
+      p95_latency_ms: block.latency_scatter?.p95_latency_ms ?? 0,
+      max_ttft_ms: block.latency_scatter?.max_ttft_ms ?? 0,
+      max_latency_ms: block.latency_scatter?.max_latency_ms ?? 0,
     },
     current_usage: {
       models: currentUsage.models ?? [],
@@ -173,7 +157,7 @@ export function clearEmbedSessionToken(): void {
   }
 }
 
-async function apiFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+export async function apiFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
   const headers = new Headers(init?.headers)
   if (isMutatingMethod(init?.method)) {
     headers.set('X-CPA-Usage-Keeper-Request', 'fetch')
@@ -290,6 +274,20 @@ export async function revokeAuthSession(id: string): Promise<void> {
   }
 }
 
+export async function updateAuthSessionAlias(id: string, alias: string): Promise<AuthManagedSessionsResponse['items'][number]> {
+  const response = await apiFetch(apiPath(`/auth/sessions/${encodeURIComponent(id)}`), {
+    method: 'PATCH',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ alias }),
+  })
+  if (!response.ok) {
+    await parseApiError(response, `Failed to update auth session alias: ${response.status}`)
+  }
+  return response.json()
+}
+
 const buildUsageRangeParams = (request: UsageRangeRequest): URLSearchParams => {
   const params = new URLSearchParams()
   params.set('range', resolveUsageRequestRange(request.range))
@@ -310,6 +308,24 @@ export async function fetchKeyOverview(request: UsageRangeRequest, signal?: Abor
   const response = await apiFetch(`${apiPath('/key-overview')}?${params.toString()}`, { signal })
   if (!response.ok) {
     await parseApiError(response, `Failed to load key overview: ${response.status}`)
+  }
+  return response.json()
+}
+
+export async function fetchKeyAnalysis(request: UsageRangeRequest, signal?: AbortSignal): Promise<AnalysisResponse> {
+  const params = buildUsageRangeParams(request)
+  const response = await apiFetch(`${apiPath('/key-analysis')}?${params.toString()}`, { signal })
+  if (!response.ok) {
+    await parseApiError(response, `Failed to load key analysis: ${response.status}`)
+  }
+  return response.json()
+}
+
+export async function fetchKeyAnalysisLatency(request: UsageRangeRequest, signal?: AbortSignal): Promise<AnalysisLatencyDiagnostics> {
+  const params = buildUsageRangeParams(request)
+  const response = await apiFetch(`${apiPath('/key-analysis/latency')}?${params.toString()}`, { signal })
+  if (!response.ok) {
+    await parseApiError(response, `Failed to load key analysis latency: ${response.status}`)
   }
   return response.json()
 }
@@ -370,6 +386,19 @@ export async function fetchUsageOverview(request: UsageRangeRequest, signal?: Ab
   return response.json()
 }
 
+export async function fetchUsageOverviewComparisons(request: UsageRangeRequest, options: { signal?: AbortSignal; apiKeyId?: string; keyViewer?: boolean } = {}): Promise<UsageOverviewComparisons> {
+  const params = buildUsageRangeParams(request)
+  const selectedAPIKeyId = options.apiKeyId?.trim()
+  if (selectedAPIKeyId) params.set('api_key_id', selectedAPIKeyId)
+  const path = options.keyViewer ? '/key-overview/comparisons' : '/usage/overview/comparisons'
+  const query = params.toString()
+  const response = await apiFetch(`${apiPath(path)}${query ? `?${query}` : ''}`, { signal: options.signal })
+  if (!response.ok) {
+    await parseApiError(response, `Failed to load usage overview comparisons: ${response.status}`)
+  }
+  return response.json()
+}
+
 export async function fetchUsageActivity({ request, apiKeyId, signal }: FetchUsageActivityOptions): Promise<UsageActivityResponse> {
   const params = buildUsageActivityParams(request)
   const selectedAPIKeyId = apiKeyId?.trim()
@@ -407,9 +436,12 @@ export async function fetchUsageOverviewRealtime(options: FetchUsageOverviewReal
 export interface FetchUsageEventsOptions {
   page?: number
   pageSize?: number
+  cursorMode?: boolean
+  cursor?: string
   model?: string
   // Request Events 页面沿用 Source 命名；这里传的是 usage identity，后端会转换为 auth_index 查询。
   source?: string
+  authType?: UsageIdentityAuthType
   result?: string
   apiKeyId?: string
 }
@@ -425,13 +457,20 @@ interface UsageEventRequestLogDownloadURLResponse {
   download_url?: string
 }
 
-function buildUsageEventsParams(request: UsageRangeRequest, options?: FetchUsageEventsOptions, includePagination = true): URLSearchParams {
-  const params = buildUsageRangeParams(request)
+function buildUsageEventsParams(request: UsageRangeRequest | undefined, options?: FetchUsageEventsOptions, includePagination = true): URLSearchParams {
+  const params = request ? buildUsageRangeParams(request) : new URLSearchParams()
   if (includePagination && typeof options?.page === 'number' && Number.isFinite(options.page) && options.page > 0) {
     params.set('page', String(Math.floor(options.page)))
   }
   if (includePagination && typeof options?.pageSize === 'number' && Number.isFinite(options.pageSize) && options.pageSize > 0) {
     params.set('page_size', String(Math.floor(options.pageSize)))
+  }
+  if (includePagination && options?.cursorMode) {
+    params.set('cursor_mode', 'true')
+  }
+  const cursor = options?.cursor?.trim()
+  if (includePagination && cursor) {
+    params.set('cursor', cursor)
   }
   const model = options?.model?.trim()
   if (model) {
@@ -441,6 +480,9 @@ function buildUsageEventsParams(request: UsageRangeRequest, options?: FetchUsage
   if (source) {
     // Source 下拉的 value 不是 usage_events.source 原始字段，而是后端用于 auth_index 查询的 identity。
     params.set('source', source)
+  }
+  if (options?.authType === 1 || options?.authType === 2) {
+    params.set('auth_type', String(options.authType))
   }
   const result = options?.result?.trim()
   if (result) {
@@ -474,12 +516,25 @@ export async function fetchUsageEventSourceFilterOptions(signal?: AbortSignal): 
   return response.json()
 }
 
-export async function fetchUsageEvents(request: UsageRangeRequest, signal?: AbortSignal, options?: FetchUsageEventsOptions): Promise<UsageEventsResponse> {
+export async function fetchUsageEvents(request: UsageRangeRequest | undefined, signal?: AbortSignal, options?: FetchUsageEventsOptions): Promise<UsageEventsResponse> {
   const params = buildUsageEventsParams(request, options)
   const query = params.toString()
   const response = await apiFetch(`${apiPath('/usage/events')}${query ? `?${query}` : ''}`, { signal })
   if (!response.ok) {
     await parseApiError(response, `Failed to load usage events: ${response.status}`)
+  }
+  return response.json()
+}
+
+export async function fetchErrorEvents(identityId: string, signal?: AbortSignal, cursor?: string, pageSize = 50): Promise<ErrorEventsResponse> {
+  const params = new URLSearchParams()
+  params.set('page_size', String(pageSize))
+  const normalizedCursor = cursor?.trim()
+  if (normalizedCursor) params.set('cursor', normalizedCursor)
+  const query = params.toString()
+  const response = await apiFetch(`${apiPath(`/usage/identities/${encodeURIComponent(identityId)}/errors`)}?${query}`, { signal, cache: 'no-store' })
+  if (!response.ok) {
+    await parseApiError(response, `Failed to load CPA error events: ${response.status}`)
   }
   return response.json()
 }
@@ -519,7 +574,8 @@ export async function exportUsageEvents(request: UsageRangeRequest, format: Usag
   }
 }
 
-export type UsageIdentityPageSort = 'priority' | 'total_requests' | 'total_tokens' | 'last_used_at'
+export const USAGE_IDENTITY_PAGE_SORTS = ['priority', 'total_requests', 'total_tokens', 'last_used_at'] as const
+export type UsageIdentityPageSort = typeof USAGE_IDENTITY_PAGE_SORTS[number]
 
 export interface FetchUsageIdentitiesPageOptions {
   authType?: UsageIdentityAuthType
@@ -534,6 +590,14 @@ export async function fetchUsageIdentities(signal?: AbortSignal): Promise<UsageI
   const response = await apiFetch(apiPath('/usage/identities'), { signal })
   if (!response.ok) {
     await parseApiError(response, `Failed to load usage identities: ${response.status}`)
+  }
+  return response.json()
+}
+
+export async function fetchUsageIdentity(id: string, signal?: AbortSignal): Promise<UsageIdentity> {
+  const response = await apiFetch(apiPath(`/usage/identities/${encodeURIComponent(id)}`), { signal })
+  if (!response.ok) {
+    await parseApiError(response, `Failed to load usage identity: ${response.status}`)
   }
   return response.json()
 }
@@ -583,6 +647,14 @@ export async function updateUsageIdentityAlias(id: string, alias: string | null)
   return response.json()
 }
 
+export async function resetUsageIdentityStats(id: string): Promise<UsageIdentity> {
+  const response = await apiFetch(apiPath(`/usage/identities/${encodeURIComponent(id)}/stats/reset`), { method: 'POST' })
+  if (!response.ok) {
+    await parseApiError(response, `Failed to reset usage identity stats: ${response.status}`)
+  }
+  return response.json()
+}
+
 export async function fetchUsageQuotaCache(authIndexes: string[], signal?: AbortSignal): Promise<UsageQuotaCacheResponse> {
   // cache 只读后端已有结果，不携带刷新 limit，避免把缓存读取误当队列提交。
   const response = await apiFetch(apiPath('/quota/cache'), {
@@ -597,6 +669,34 @@ export async function fetchUsageQuotaCache(authIndexes: string[], signal?: Abort
     await parseApiError(response, `Failed to load cached usage quotas: ${response.status}`)
   }
   return response.json()
+}
+
+export interface FetchCodexQuotaHistoryOptions {
+  windowRole?: 'primary' | 'secondary'
+}
+
+export async function fetchCodexQuotaHistory(
+  authIndex: string,
+  options: FetchCodexQuotaHistoryOptions = {},
+  signal?: AbortSignal,
+): Promise<CodexQuotaHistoryResponse> {
+  const params = new URLSearchParams()
+  if (options.windowRole) params.set('window_role', options.windowRole)
+  const query = params.toString()
+  const response = await apiFetch(`${apiPath(`/quota/history/${encodeURIComponent(authIndex)}`)}${query ? `?${query}` : ''}`, { signal })
+  if (!response.ok) {
+    await parseApiError(response, `Failed to load quota history: ${response.status}`)
+  }
+  return response.json()
+}
+
+export async function deleteCodexQuotaHistoryCycle(authIndex: string, cycleId: number, signal?: AbortSignal): Promise<void> {
+  const response = await apiFetch(apiPath(`/quota/history/${encodeURIComponent(authIndex)}/cycles/${cycleId}`), {
+    method: 'DELETE', signal,
+  })
+  if (!response.ok) {
+    await parseApiError(response, `Failed to delete quota cycle: ${response.status}`)
+  }
 }
 
 export async function refreshUsageQuotas(authIndexes: string[], signal?: AbortSignal): Promise<UsageQuotaRefreshResponse> {
@@ -635,13 +735,13 @@ export async function startUsageQuotaInspection(signal?: AbortSignal): Promise<U
 }
 
 
-export async function resetUsageQuota(authIndex: string, signal?: AbortSignal): Promise<UsageQuotaResetResponse> {
+export async function resetUsageQuota(authIndex: string, signal?: AbortSignal, grantId?: string, organizationId?: string): Promise<UsageQuotaResetResponse> {
   const response = await apiFetch(apiPath('/quota/reset'), {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({ auth_index: authIndex }),
+    body: JSON.stringify({ auth_index: authIndex, ...(grantId ? { grant_id: grantId, organization_id: organizationId } : {}) }),
     signal,
   })
   if (!response.ok) {
@@ -654,6 +754,14 @@ export async function fetchUsageQuotaResetCredits(authIndex: string, signal?: Ab
   const response = await apiFetch(apiPath(`/quota/reset-credits/${encodeURIComponent(authIndex)}`), { signal })
   if (!response.ok) {
     await parseApiError(response, `Failed to load quota reset credits: ${response.status}`)
+  }
+  return response.json()
+}
+
+export async function fetchClaudeResetGrants(authIndex: string, signal?: AbortSignal): Promise<import('./types').ClaudeResetGrantsResponse> {
+  const response = await apiFetch(apiPath(`/quota/claude-reset-grants/${encodeURIComponent(authIndex)}`), { signal })
+  if (!response.ok) {
+    await parseApiError(response, `Failed to load Claude reset grants: ${response.status}`)
   }
   return response.json()
 }
@@ -676,6 +784,50 @@ export async function setAuthFilesDisabled(names: string[], disabled: boolean): 
   })
   if (!response.ok) {
     await parseApiError(response, `Failed to update auth file status: ${response.status}`)
+  }
+  return response.json()
+}
+
+export type CredentialStatusKind = 'auth-file' | 'ai-provider'
+
+export interface CredentialStatusResponse {
+  auth_index: string
+  disabled: boolean
+}
+
+// 认证文件与 AI 供应商共用前端调用形状，由后端按 auth_index 翻译成各自的上游写操作。
+const credentialStatusPathByKind: Record<CredentialStatusKind, string> = {
+  'auth-file': '/auth-files',
+  'ai-provider': '/ai-providers',
+}
+
+export async function setCredentialDisabled(kind: CredentialStatusKind, authIndex: string, disabled: boolean): Promise<CredentialStatusResponse> {
+  const response = await apiFetch(apiPath(`${credentialStatusPathByKind[kind]}/${encodeURIComponent(authIndex)}/status`), {
+    method: 'PATCH',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ disabled }),
+  })
+  if (!response.ok) {
+    await parseApiError(response, `Failed to update credential status: ${response.status}`)
+  }
+  return response.json()
+}
+
+export interface CredentialPriorityResponse {
+  auth_index: string
+  priority: number
+}
+
+export async function setCredentialPriority(kind: CredentialStatusKind, authIndex: string, priority: number): Promise<CredentialPriorityResponse> {
+  const response = await apiFetch(apiPath(`${credentialStatusPathByKind[kind]}/${encodeURIComponent(authIndex)}/priority`), {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ priority }),
+  })
+  if (!response.ok) {
+    await parseApiError(response, `Failed to update credential priority: ${response.status}`)
   }
   return response.json()
 }
@@ -852,8 +1004,8 @@ export async function replacePricingRules(
   return response.json()
 }
 
-export async function fetchPricingSyncPreview(signal?: AbortSignal): Promise<PricingSyncPreviewResponse> {
-  const response = await apiFetch(apiPath('/pricing/sync/preview'), { signal, cache: 'no-store' })
+export async function fetchPricingSyncPreview(source: PricingSyncSource = 'models-dev', signal?: AbortSignal): Promise<PricingSyncPreviewResponse> {
+  const response = await apiFetch(apiPath('/pricing/sync/preview') + '?source=' + encodeURIComponent(source), { signal, cache: 'no-store' })
   if (!response.ok) {
     await parseApiError(response, `Failed to preview pricing sync: ${response.status}`)
   }

@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useRef, useState, type CSSProperties, type KeyboardEvent } from 'react';
 import { createPortal } from 'react-dom';
+import { useAnchorPosition } from '@/hooks/useAnchorPosition';
 import { useTranslation } from 'react-i18next';
 import type { UsageCustomRange, UsageTimeRange } from '@/lib/types';
 import { Modal } from '@/components/ui/Modal';
 import { IconChevronDown, IconTimer } from '@/components/ui/icons';
-import { formatCustomRangeLabel, normalizeCustomRange } from '@/utils/usage/customRange';
+import { DEFAULT_CUSTOM_DAY_RANGE_MAX_DAYS, formatCustomRangeLabel, normalizeCustomRange } from '@/utils/usage/customRange';
 import {
   buildRollingUsageRange,
   parseSelectableUsageRange,
@@ -81,6 +82,7 @@ interface RangePanelProps {
   customAnchorMs: number;
   timeZone: string;
   customEnabled: boolean;
+  maxCustomDayRangeDays: number;
   locale?: string;
   onModeChange: (mode: UsageTimeRangeMode) => void;
   onRollingValueChange: (unit: RollingUnit, value: number) => void;
@@ -98,6 +100,7 @@ function TimeRangePanel({
   customAnchorMs,
   timeZone,
   customEnabled,
+  maxCustomDayRangeDays,
   locale,
   onModeChange,
   onRollingValueChange,
@@ -214,6 +217,7 @@ function TimeRangePanel({
           timeZone={timeZone}
           locale={locale}
           anchorMs={customAnchorMs}
+          maxDayRangeDays={maxCustomDayRangeDays}
           onChange={onCustomRangeChange}
           onApply={onCustomApply}
           onCancel={onCustomCancel}
@@ -236,10 +240,20 @@ interface TimeRangeControlProps {
   customRange?: UsageCustomRange;
   onChange: (value: UsageTimeRange, customRange?: UsageCustomRange) => void;
   ariaLabel: string;
+  labelInsideTrigger?: boolean;
   timeZone?: string;
+  maxCustomDayRangeDays?: number;
 }
 
-export function TimeRangeControl({ value, customRange, onChange, ariaLabel, timeZone: providedTimeZone }: TimeRangeControlProps) {
+export function TimeRangeControl({
+  value,
+  customRange,
+  onChange,
+  ariaLabel,
+  labelInsideTrigger = false,
+  timeZone: providedTimeZone,
+  maxCustomDayRangeDays = DEFAULT_CUSTOM_DAY_RANGE_MAX_DAYS,
+}: TimeRangeControlProps) {
   const { t, i18n } = useTranslation();
   const timeZone = providedTimeZone?.trim() || 'UTC';
   const customEnabled = Boolean(providedTimeZone?.trim());
@@ -251,6 +265,7 @@ export function TimeRangeControl({ value, customRange, onChange, ariaLabel, time
   const [customDraft, setCustomDraft] = useState<UsageCustomRange>(() => normalizeCustomRange(customRange, {
     nowMs: customAnchorMs,
     timeZone,
+    maxDayRangeDays: maxCustomDayRangeDays,
   }));
   const [rollingValues, setRollingValues] = useState<Record<RollingUnit, number>>(() => ({
     ...DEFAULT_ROLLING_VALUES,
@@ -261,6 +276,7 @@ export function TimeRangeControl({ value, customRange, onChange, ariaLabel, time
   const [mobileOpen, setMobileOpen] = useState(false);
   const [popoverPosition, setPopoverPosition] = useState({ top: 0, left: 0 });
   const [previousAppliedMode, setPreviousAppliedMode] = useState(appliedMode);
+  const [previousMaxCustomDayRangeDays, setPreviousMaxCustomDayRangeDays] = useState(maxCustomDayRangeDays);
   const desktopTriggerRef = useRef<HTMLButtonElement | null>(null);
   const desktopPopoverRef = useRef<HTMLDivElement | null>(null);
   const mobileOpenRef = useRef(false);
@@ -268,10 +284,15 @@ export function TimeRangeControl({ value, customRange, onChange, ariaLabel, time
   const latestRollingValuesRef = useRef(rollingValues);
   const activeRollingPointerRef = useRef<{ unit: RollingUnit; pointerId: number } | null>(null);
 
-  if (previousAppliedMode !== appliedMode) {
+  if (previousAppliedMode !== appliedMode || previousMaxCustomDayRangeDays !== maxCustomDayRangeDays) {
     setPreviousAppliedMode(appliedMode);
-    if (appliedMode === 'custom' && previousAppliedMode !== 'custom') {
-      setCustomDraft(normalizeCustomRange(customRange, { nowMs: customAnchorMs, timeZone }));
+    setPreviousMaxCustomDayRangeDays(maxCustomDayRangeDays);
+    if (appliedMode === 'custom') {
+      setCustomDraft(normalizeCustomRange(customRange, {
+        nowMs: customAnchorMs,
+        timeZone,
+        maxDayRangeDays: maxCustomDayRangeDays,
+      }));
     }
   }
 
@@ -304,8 +325,12 @@ export function TimeRangeControl({ value, customRange, onChange, ariaLabel, time
   const prepareCustomDraft = useCallback(() => {
     const anchorMs = Date.now();
     setCustomAnchorMs(anchorMs);
-    setCustomDraft(normalizeCustomRange(customRange, { nowMs: anchorMs, timeZone }));
-  }, [customRange, timeZone]);
+    setCustomDraft(normalizeCustomRange(customRange, {
+      nowMs: anchorMs,
+      timeZone,
+      maxDayRangeDays: maxCustomDayRangeDays,
+    }));
+  }, [customRange, maxCustomDayRangeDays, timeZone]);
 
   const handleModeChange = (nextMode: UsageTimeRangeMode) => {
     if (appliedMode === 'hour' || appliedMode === 'day') {
@@ -369,28 +394,30 @@ export function TimeRangeControl({ value, customRange, onChange, ariaLabel, time
     };
   }, [handleRollingValueCommit]);
 
-  const updatePopoverPosition = useCallback(() => {
-    const trigger = desktopTriggerRef.current;
-    if (!trigger) return;
-    const rect = trigger.getBoundingClientRect();
+  const updatePopoverPosition = useCallback((rect: DOMRect) => {
     const width = Math.min(368, window.innerWidth - 24);
     const left = Math.min(Math.max(12, rect.right - width), window.innerWidth - width - 12);
     setPopoverPosition({ top: rect.bottom + 8, left });
   }, []);
+  useAnchorPosition(desktopOpen, desktopTriggerRef, updatePopoverPosition);
 
   const discardDraft = useCallback(() => {
     activeRollingPointerRef.current = null;
     setDraftingUnit(null);
     setPendingMode(null);
     if (appliedMode === 'custom') {
-      setCustomDraft(normalizeCustomRange(customRange, { nowMs: customAnchorMs, timeZone }));
+      setCustomDraft(normalizeCustomRange(customRange, {
+        nowMs: customAnchorMs,
+        timeZone,
+        maxDayRangeDays: maxCustomDayRangeDays,
+      }));
       return;
     }
     if (appliedMode !== 'hour' && appliedMode !== 'day') return;
     const appliedValue = parsedRange.value ?? DEFAULT_ROLLING_VALUES[appliedMode];
     latestRollingValuesRef.current = { ...latestRollingValuesRef.current, [appliedMode]: appliedValue };
     setRollingValues((current) => current[appliedMode] === appliedValue ? current : { ...current, [appliedMode]: appliedValue });
-  }, [appliedMode, customAnchorMs, customRange, parsedRange.value, timeZone]);
+  }, [appliedMode, customAnchorMs, customRange, maxCustomDayRangeDays, parsedRange.value, timeZone]);
 
   const closeDesktopPopover = useCallback((restoreFocus = false) => {
     discardDraft();
@@ -414,9 +441,8 @@ export function TimeRangeControl({ value, customRange, onChange, ariaLabel, time
       return;
     }
     if (appliedMode === 'custom') prepareCustomDraft();
-    updatePopoverPosition();
     setDesktopOpen(true);
-  }, [appliedMode, closeDesktopPopover, desktopOpen, prepareCustomDraft, updatePopoverPosition]);
+  }, [appliedMode, closeDesktopPopover, desktopOpen, prepareCustomDraft]);
 
   const openMobileModal = useCallback(() => {
     closeDesktopPopover();
@@ -484,17 +510,13 @@ export function TimeRangeControl({ value, customRange, onChange, ariaLabel, time
         firstElement.focus();
       }
     };
-    window.addEventListener('resize', updatePopoverPosition);
-    window.addEventListener('scroll', updatePopoverPosition, true);
     document.addEventListener('pointerdown', handlePointerDown);
     document.addEventListener('keydown', handleKeyDown);
     return () => {
-      window.removeEventListener('resize', updatePopoverPosition);
-      window.removeEventListener('scroll', updatePopoverPosition, true);
       document.removeEventListener('pointerdown', handlePointerDown);
       document.removeEventListener('keydown', handleKeyDown);
     };
-  }, [closeDesktopPopover, desktopOpen, updatePopoverPosition]);
+  }, [closeDesktopPopover, desktopOpen]);
 
   const handleCustomApply = () => {
     lastEmittedRangeRef.current = 'custom';
@@ -521,6 +543,7 @@ export function TimeRangeControl({ value, customRange, onChange, ariaLabel, time
       customAnchorMs={customAnchorMs}
       timeZone={timeZone}
       customEnabled={customEnabled}
+      maxCustomDayRangeDays={maxCustomDayRangeDays}
       locale={i18n?.language}
       onModeChange={handleModeChange}
       onRollingValueChange={handleRollingValueChange}
@@ -536,7 +559,7 @@ export function TimeRangeControl({ value, customRange, onChange, ariaLabel, time
   return (
     <div className={styles.controlRoot}>
       <div className={styles.desktopShell} data-time-range-shell="desktop">
-        <span className={styles.shellLabel}>{ariaLabel}</span>
+        {!labelInsideTrigger && <span className={styles.shellLabel}>{ariaLabel}</span>}
         <button
           ref={desktopTriggerRef}
           type="button"
@@ -547,14 +570,15 @@ export function TimeRangeControl({ value, customRange, onChange, ariaLabel, time
           aria-expanded={desktopOpen}
           onClick={toggleDesktopPopover}
         >
+          {labelInsideTrigger && <span className={styles.shellLabel} data-dashboard-filter-caption>{ariaLabel}</span>}
           <IconTimer size={16} className={styles.triggerIcon} />
-          <span className={styles.triggerLabel}>{currentLabel}</span>
+          <span className={styles.triggerLabel} data-time-range-value>{currentLabel}</span>
           <IconChevronDown size={14} className={styles.triggerChevron} />
         </button>
       </div>
 
       <div className={styles.mobileShell} data-time-range-shell="mobile">
-        <span className={styles.shellLabel}>{ariaLabel}</span>
+        {!labelInsideTrigger && <span className={styles.shellLabel}>{ariaLabel}</span>}
         <button
           type="button"
           className={styles.mobileTrigger}
@@ -564,8 +588,9 @@ export function TimeRangeControl({ value, customRange, onChange, ariaLabel, time
           aria-expanded={mobileOpen}
           onClick={openMobileModal}
         >
+          {labelInsideTrigger && <span className={styles.shellLabel} data-dashboard-filter-caption>{ariaLabel}</span>}
           <IconTimer size={16} className={styles.triggerIcon} />
-          <span className={styles.triggerLabel}>{currentLabel}</span>
+          <span className={styles.triggerLabel} data-time-range-value>{currentLabel}</span>
           <IconChevronDown size={16} className={styles.triggerChevron} />
         </button>
       </div>
